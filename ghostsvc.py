@@ -2987,6 +2987,9 @@ def self_test():
     check(_parse(["--self-test"]).self_test is True, "--self-test parses")
     check(_parse(["--server", SERVER, "--apply"]).apply is True,
           "--apply is read")
+    refuses(["--server", SERVER, "--ap"],
+            "a unique prefix of the write flag is refused, because argparse "
+            "would otherwise take --ap for --apply  <-- pinned defect")
     check(_parse(["--server", SERVER, "--insecure"]).insecure is True,
           "--insecure is read")
     check(_parse(["--server", SERVER, "--admin"]).admin is True,
@@ -3096,6 +3099,7 @@ def _parse(argv):
         epilog="Read-only. No flag changes anything on the server or in the "
                "portal. The password is never a flag: export %s or answer the "
                "prompt." % SECRET_ENV,
+        allow_abbrev=False,
     )
     ap.add_argument("--server",
                     help="federated server url, e.g. "

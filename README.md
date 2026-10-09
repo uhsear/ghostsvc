@@ -76,10 +76,11 @@ PASS  and the report from the previous run was not overwritten by a refused one 
 PASS  a server whose catalog will not answer exits 2 rather than reporting every item as an orphan  <-- pinned defect
 PASS  a --server with no --portal is a usage error, because every service would be a ghost  <-- pinned defect
 ...
+PASS  a unique prefix of the write flag is refused, because argparse would otherwise take --ap for --apply  <-- pinned defect
 PASS  a plausible-looking --unpublish is refused, because this tool changes nothing  <-- pinned defect
 PASS  the harness records a false check, a missing exception, two wrong exceptions, an argv argparse accepted, two bad enumerations, four bad url comparisons and three bad calls as thirteen failures, so a broken tool turns this self-test red  <-- pinned defect
 --------------------------------------------------------------------
-445 assertions, 0 failed
+446 assertions, 0 failed
 ```
 
 ## Requirements
