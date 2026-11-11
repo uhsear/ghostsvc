@@ -24,7 +24,8 @@ wrong and the ghost list is entirely false positives, which is worse than no
 list at all.
 
 It is read-only. No flag changes anything on the server or in the portal, and
-the only thing it writes is a report file, which needs --apply.
+the only thing it writes is a report file, which needs --apply. (--self-test
+also makes a temporary directory and removes it again.)
 
     python ghostsvc.py --self-test
     python ghostsvc.py --server https://gis.example.com/arcgis \\
@@ -34,8 +35,8 @@ the only thing it writes is a report file, which needs --apply.
         --out ghosts.csv --format csv --apply
 
 Exit codes: 0 every service has an item and none answered anonymously, 1 there
-are findings to review, 2 the server or the portal could not be read, 64 usage
-error.
+are findings to review, 2 the server or the portal could not be read, the
+report could not be written, or no service could be probed, 64 usage error.
 """
 
 from __future__ import print_function
@@ -119,6 +120,10 @@ REDACTED = "[redacted]"
 # history, in scheduler logs and in this tool's own error messages.
 SECRET_ENV = "GHOSTSVC_PASSWORD"
 
+# Environment variable an existing portal token is read from when --token is
+# not given. A token on the command line is exactly as visible as a password.
+TOKEN_ENV = "GHOSTSVC_TOKEN"
+
 # =============================================================================
 # End of CONFIGURATION.
 # =============================================================================
@@ -132,6 +137,13 @@ SEVERITY = {
     "ghost": 50,
     "orphan": 20,
 }
+
+# Fields whose presence in a JSON answer marks it as a service description.
+SERVICE_MARKERS = ("currentVersion", "serviceDescription", "capabilities",
+                   "layers", "serviceDataType")
+
+# Error codes in a 200 answer that mean "a token is needed": a definite no.
+REFUSAL_CODES = (401, 403, 498, 499)
 
 # Columns of the CSV report, in order. Fixed, because a spreadsheet somebody
 # built a pivot table on top of must not gain a column between runs.
@@ -156,16 +168,23 @@ class EnumerationIncomplete(RuntimeError):
 # ----------------------------------------------------------- url normalisation
 
 def sanitize_url(url):
-    """Drop the query string and fragment from a url, keeping the rest.
+    """Drop the query string, the fragment and any user:password@ from a url.
 
     Called on every url before it is stored or printed. A portal item's url
     field and a service url both come back carrying whatever query string the
     publisher left on them, and on a federated deployment that is regularly a
-    token. The report is a file that sits on a share for months.
+    token. A url typed as https://user:password@host/... carries the credential
+    in the authority instead. The report is a file that sits on a share for
+    months.
     """
     raw = "%s" % (url or "")
     raw = raw.split("#", 1)[0]
-    return raw.split("?", 1)[0]
+    raw = raw.split("?", 1)[0]
+    scheme, sep, rest = raw.partition("://")
+    if not sep:
+        scheme, rest = "", raw
+    authority, slash, path = rest.partition("/")
+    return scheme + sep + authority.rpartition("@")[2] + slash + path
 
 
 def _short_host(host):
@@ -238,10 +257,12 @@ def service_key(url):
     trailing slash, the rest/admin split, and case in the folder and service
     name.
 
-    Folder and service names are compared case-insensitively. ArcGIS Server
-    will not publish two services in one folder whose names differ only by
-    case, so folding case cannot merge two real services, and not folding it
+    Folder and service names are compared case-insensitively. Not folding case
     reports Roads/MapServer as a ghost because the item says roads/MapServer.
+    Esri's documentation does not say whether a server may hold two services
+    in one folder whose names differ only by case, so this is a decision and
+    not a documented fact: a server that did hold both would see them keyed as
+    one.
 
     Refusing a url is deliberate. A url this function cannot read has to be
     counted and reported as unreadable, because a key built from a guess is a
@@ -299,6 +320,28 @@ def keyed(url):
         return service_key(url)
     except ValueError:
         return None
+
+
+def host_domain(url):
+    """The domain part of a url's host, or "" when it has none to compare.
+
+    service_key keeps only the first label of a host, so gis.alpha.example.org
+    and gis.beta.example.net both key to "gis". The domain is what tells them
+    apart again. A short name, an address literal and an empty host have no
+    domain, and a url with none is compatible with any domain: nothing says it
+    is a different machine.
+    """
+    raw = ("%s" % (url or "")).strip()
+    parts = urllib.parse.urlsplit(raw if "://" in raw else "//" + raw)
+    host = (parts.hostname or "").lower().rstrip(".")
+    short = _short_host(host)
+    return host[len(short) + 1:] if short != host else ""
+
+
+def same_machine(left, right):
+    """False only when both urls name a domain and the domains differ."""
+    one, other = host_domain(left), host_domain(right)
+    return not (one and other and one != other)
 
 
 # ------------------------------------------------------------- server catalog
@@ -428,11 +471,35 @@ def is_anonymous(status, body, error=None):
     err = body.get("error")
     if isinstance(err, dict):
         return False, "%s %s" % (err.get("code"), err.get("message"))
-    for marker in ("currentVersion", "serviceDescription", "capabilities",
-                   "layers", "serviceDataType"):
+    for marker in SERVICE_MARKERS:
         if marker in body:
             return True, "answered with %s and no token" % marker
     return False, "the response carried no service description"
+
+
+def probe_conclusive(status, body, error=None):
+    """Did the probe get a definite yes or a definite no out of the service?
+
+    is_anonymous says False for a service that refused and also for a service
+    that was down, and those are not the same finding. A refusal (401, 403, a
+    login page, an error envelope that asks for a token) is a no. A service
+    that never answered, an HTTP 500 or 404 and an error nobody recognises
+    leave the question open, and an audit that counts them as no reports a
+    clean result it did not earn.
+    """
+    if error:
+        return False
+    status = int(status)
+    if status in (401, 403):
+        return True
+    if status != 200:
+        return False
+    if not isinstance(body, dict):
+        return True                        # a login page: the deployment said no
+    err = body.get("error")
+    if isinstance(err, dict):
+        return err.get("code") in REFUSAL_CODES
+    return any(marker in body for marker in SERVICE_MARKERS)
 
 
 # --------------------------------------------------------- portal enumeration
@@ -718,9 +785,11 @@ def item_record(raw):
 class Finding(object):
     """One service, or one item, that the reconcile wants somebody to look at."""
 
-    def __init__(self, kind, key, service=None, items=(), detail=""):
+    def __init__(self, kind, key, service=None, items=(), detail="",
+                 tested=True):
         if kind not in SEVERITY:
             raise ValueError("%r is not a finding kind" % (kind,))
+        self.tested = tested
         self.kind = kind
         self.severity = SEVERITY[kind]
         self.key = key
@@ -750,7 +819,12 @@ class Finding(object):
 class Report(object):
     """The finished reconcile: what was compared and what came out of it."""
 
-    def __init__(self, findings, services, items, unreadable, warnings=()):
+    def __init__(self, findings, services, items, unreadable, warnings=(),
+                 probes=None):
+        # probes maps a service key to True when its probe was conclusive and
+        # to False when it was not. None means every service was probed, and
+        # an empty dict means the probe was skipped.
+        self.probes = probes
         self.findings = sorted(findings, key=lambda f: f.sort_key())
         self.services = services
         self.items = items
@@ -773,6 +847,23 @@ class Report(object):
         return self.of_kind("orphan")
 
     @property
+    def untested(self):
+        """Keys of the services nobody got an answer about."""
+        if self.probes is None:
+            return []
+        return sorted(set(s["key"] for s in self.services
+                          if not self.probes.get(s["key"])))
+
+    @property
+    def probe_skipped(self):
+        return self.probes is not None and not self.probes
+
+    @property
+    def probe_failed(self):
+        """The probe ran and not one service gave a definite answer."""
+        return bool(self.probes) and not any(self.probes.values())
+
+    @property
     def matched(self):
         """Services that have a portal item and did not answer anonymously."""
         flagged = set(f.key for f in self.findings if f.service)
@@ -783,7 +874,7 @@ class Report(object):
             len(self.findings), len(self.services), len(self.items))
 
 
-def reconcile(services, items, anonymous=(), details=None):
+def reconcile(services, items, anonymous=(), details=None, probes=None):
     """Join a server catalog to a portal item list and report the difference.
 
     A service and an item meet when their urls normalise to the same key, which
@@ -794,6 +885,7 @@ def reconcile(services, items, anonymous=(), details=None):
     details = details or {}
     by_key = {}
     unreadable = []
+    claimed = set()
     for raw in items:
         key = keyed(raw.get("url"))
         if key is None:
@@ -807,11 +899,14 @@ def reconcile(services, items, anonymous=(), details=None):
         by_key.setdefault(key, []).append(raw)
 
     findings = []
-    server_keys = set()
     for svc in services:
         key = svc["key"]
-        server_keys.add(key)
-        mine = by_key.get(key) or []
+        # The key folds a host to its first label, so an item on a different
+        # domain with the same first label is another server's service, not
+        # this one's.
+        mine = [raw for raw in by_key.get(key) or []
+                if same_machine(raw.get("url"), svc.get("url"))]
+        claimed.update(id(raw) for raw in mine)
         open_to_all = key in anon
         if open_to_all and not mine:
             kind = "anonymous-ghost"
@@ -821,13 +916,15 @@ def reconcile(services, items, anonymous=(), details=None):
             kind = "ghost"
         else:
             continue
-        findings.append(Finding(kind, key, svc, mine, details.get(key, "")))
+        tested = probes is None or bool(probes.get(key))
+        findings.append(Finding(kind, key, svc, mine, details.get(key, ""),
+                                tested))
     for key in sorted(by_key):
-        if key in server_keys:
-            continue
         for raw in by_key[key]:
-            findings.append(Finding("orphan", key, None, [raw]))
-    return Report(findings, list(services), list(items), unreadable)
+            if id(raw) not in claimed:
+                findings.append(Finding("orphan", key, None, [raw]))
+    return Report(findings, list(services), list(items), unreadable,
+                  probes=probes)
 
 
 def build_report(server, portal, query, taken, report):
@@ -844,6 +941,7 @@ def build_report(server, portal, query, taken, report):
         "ghosts": len(report.ghosts),
         "orphans": len(report.orphans),
         "anonymous": len(report.anonymous),
+        "unprobed": len(report.untested),
         "warnings": list(report.warnings),
         "unreadable_items": sorted(report.unreadable, key=lambda r: r["id"]),
         "findings": [finding_record(f) for f in report.findings],
@@ -861,7 +959,7 @@ def finding_record(finding):
         "folder": svc.get("folder", ""),
         "name": svc.get("name", ""),
         "type": svc.get("type", ""),
-        "anonymous": finding.anonymous,
+        "anonymous": finding.anonymous if finding.tested else None,
         "detail": finding.detail,
         "items": list(finding.items),
     }
@@ -898,7 +996,8 @@ def csv_rows(document):
         base = [rec["kind"], rec["severity"], cell(rec["key"]),
                 cell(rec["service_url"]), cell(rec["folder"]),
                 cell(rec["name"]), cell(rec["type"]),
-                "yes" if rec["anonymous"] else "no", cell(rec["detail"])]
+                {True: "yes", False: "no", None: ""}[rec["anonymous"]],
+                cell(rec["detail"])]
         if not rec["items"]:
             rows.append(base + ["", "", "", "", ""])
             continue
@@ -912,7 +1011,7 @@ def csv_rows(document):
 def describe(report):
     """Render a reconcile as the lines the CLI prints."""
     out = ["%d service(s) on the server, %d portal item(s) enumerated, "
-           "%d service(s) matched an item"
+           "%d service(s) with an item and no finding"
            % (len(report.services), len(report.items), report.matched)]
     if report.unreadable:
         out.append("%d portal item(s) carried no url this tool could read, so "
@@ -924,11 +1023,29 @@ def describe(report):
             out.append("  - %s" % warning)
         out.append("The portal changed while it was being read, so a service "
                    "below may have an item after all.")
+    if report.probe_skipped:
+        out.append("The anonymous probe was not run, so nothing is known "
+                   "about who can read these services.")
+    elif report.untested:
+        out.append("%d of %d service(s) could not be probed, so they are "
+                   "neither reported anonymous nor cleared. Run again when "
+                   "they answer." % (len(report.untested), len(report.services)))
     out.append("")
     if not report.findings:
-        out.append("Every service on the server has a portal item, and not one "
-                   "of them answered")
-        out.append("without a token.")
+        if report.probe_skipped:
+            out.append("Every service on the server has a portal item.")
+        elif report.probe_failed:
+            out.append("Every service on the server has a portal item, but no "
+                       "probe got an answer, so nothing is known about who "
+                       "can read them.")
+        elif report.untested:
+            out.append("Every service on the server has a portal item, and "
+                       "every service that could be probed refused without a "
+                       "token.")
+        else:
+            out.append("Every service on the server has a portal item, and not "
+                       "one of them answered")
+            out.append("without a token.")
         return out
     out.append("%d finding(s): %d anonymous, %d ghost(s), %d orphan(s)"
                % (len(report.findings), len(report.anonymous),
@@ -947,8 +1064,15 @@ def describe(report):
 
 
 def exit_code(report):
-    """0 when there is nothing to look at, 1 when there is."""
-    return 1 if report.findings else 0
+    """0 when there is nothing to look at, 1 when there is, 2 when unsure.
+
+    A probe that ran and got no definite answer from any service proves
+    nothing, so it cannot be a clean result. Findings still win: a ghost is
+    worth reading whether or not the probe worked.
+    """
+    if report.findings:
+        return 1
+    return 2 if report.probe_failed else 0
 
 
 # ------------------------------------------------------------------- plumbing
@@ -1116,8 +1240,13 @@ def probe_service(url, insecure=False, timeout=PROBE_TIMEOUT):
 
 
 def probe_all(services, insecure=False, timeout=PROBE_TIMEOUT, echo=None,
-              probe=None):
-    """Probe every service. Returns (anonymous keys, reason per key)."""
+              probe=None, unanswered=None):
+    """Probe every service. Returns (anonymous keys, reason per key).
+
+    unanswered, when given, is a set that receives the key of every service
+    whose probe was not conclusive, so the caller can tell "refused" from
+    "could not be asked".
+    """
     probe = probe or probe_service
     anon = set()
     details = {}
@@ -1125,6 +1254,8 @@ def probe_all(services, insecure=False, timeout=PROBE_TIMEOUT, echo=None,
         status, body, error = probe(svc["url"], insecure, timeout)
         verdict, reason = is_anonymous(status, body, error)
         details[svc["key"]] = reason
+        if unanswered is not None and not probe_conclusive(status, body, error):
+            unanswered.add(svc["key"])
         if verdict:
             anon.add(svc["key"])
             if echo:
@@ -1371,8 +1502,8 @@ def self_test():
          "Roads.MapServer",
          "an admin url inside a folder meets its rest url too")
     same(REST + "/Roads/MapServer", REST + "/roads/mapserver",
-         "case in the folder and service name is folded, because ArcGIS "
-         "Server will not publish two services that differ only by it  "
+         "case in the folder and service name is folded, because an item says "
+         "roads/MapServer where the catalog says Roads/MapServer  "
          "<-- pinned defect")
     same(REST + "/Transport/Roads/MapServer", REST + "/TRANSPORT/roads/"
          "MAPSERVER",
@@ -1798,6 +1929,32 @@ def self_test():
           "the progress echo names each anonymous service as it is found")
     check(probe_all([], probe=canned_probe) == (set(), {}),
           "probing an empty catalog asks nothing")
+    for status, body, error, want, label in (
+            (0, None, "refused", False, "a transport error is not an answer"),
+            (401, None, None, True, "an HTTP 401 is a refusal"),
+            (403, None, None, True, "an HTTP 403 is a refusal"),
+            (500, None, None, False, "an HTTP 500 leaves the question open"),
+            (404, None, None, False, "an HTTP 404 leaves the question open"),
+            (200, None, None, True, "a login page is a refusal"),
+            (200, {"error": {"code": 499, "message": "Token Required"}},
+             None, True, "a 200 asking for a token is a refusal"),
+            (200, {"error": {"code": 500, "message": "not started"}},
+             None, False, "a 200 carrying some other error is not a refusal"),
+            (200, {"currentVersion": 11.2}, None, True,
+             "a service description is a definite answer"),
+            (200, {"folders": []}, None, False,
+             "a catalog listing is no answer to a probe")):
+        check(probe_conclusive(status, body, error) is want,
+              "probe_conclusive: %s  <-- pinned defect" % label)
+
+    def mixed_probe(url, insecure, timeout):
+        if "Open" in url:
+            return 200, live, None
+        return 0, None, "[Errno 111] Connection refused"
+    gone = set()
+    probe_all(catalogue, probe=mixed_probe, unanswered=gone)
+    check(gone == set(["gis/shut/MapServer"]),
+          "probe_all names the services it could not ask  <-- pinned defect")
 
     # ---- the reconcile itself
     def svc(name, folder="", stype="MapServer", host="gis.example.org"):
@@ -1951,6 +2108,98 @@ def self_test():
           "an item on the second federated server does not silence the ghost "
           "on the first  <-- pinned defect")
 
+    # Two servers whose host names share a first label. The key folds a host
+    # to that label, so the domain has to be what keeps them apart.
+    alpha = svc("Roads", host="gis.alpha.example.org")
+    beta = item("i1", "https://gis.beta.example.net/arcgis/rest/services/"
+                      "Roads/MapServer")
+    check(service_key(alpha["url"]) == service_key(beta["url"]),
+          "two servers that share a first label do key alike, which is why "
+          "the domain is compared as well")
+    other = reconcile([alpha], [beta])
+    check(sorted(f.kind for f in other.findings) == ["ghost", "orphan"],
+          "an item on another domain with the same first label does not hide "
+          "the ghost, and reads as an orphan  <-- pinned defect")
+    check(exit_code(other) == 1, "so that run exits 1, not 0")
+    check(reconcile([alpha], [item("i1", "https://gis.alpha.example.org./"
+                                   "arcgis/rest/services/ROADS/MapServer")]
+                    ).findings == [],
+          "the same domain with a trailing dot and another case still matches")
+    check(reconcile([alpha], [item("i1", "https://gis/arcgis/rest/services/"
+                                         "Roads/MapServer")]).findings == [],
+          "and so does the short host, which names no domain to disagree with")
+    check(host_domain("https://GIS.Alpha.Example.org:6443/x")
+          == "alpha.example.org", "a host's domain is everything after its "
+          "first label")
+    check(host_domain("https://gis/x") == "" and host_domain("") == ""
+          and host_domain(None) == "",
+          "a short host and no host have no domain")
+    check(host_domain("https://10.0.0.5/x") == ""
+          and host_domain("https://[2001:db8::1]/x") == "",
+          "an address literal has no domain either")
+    check(same_machine("https://gis.a.org/x", "https://gis.b.org/x") is False
+          and same_machine("https://gis/x", "https://gis.b.org/x") is True
+          and same_machine("https://gis.a.org/x", "https://gis.a.org/y")
+          is True,
+          "only two named, different domains are different machines")
+
+    # A probe that could not ask is not a probe that was refused.
+    road_key, rail_key = roads["key"], rail["key"]
+    both_items = [item("i1", REST + "/Roads/MapServer"),
+                  item("i2", REST + "/Transport/Rail/MapServer")]
+    skipped = reconcile([roads, rail], both_items, probes={})
+    check(skipped.findings == [] and skipped.probe_skipped
+          and exit_code(skipped) == 0,
+          "a run that skipped the probe has no finding and exits 0")
+    check(any("probe was not run" in line for line in describe(skipped))
+          and not any("not one of them answered" in line
+                      for line in describe(skipped)),
+          "but it does not say that no service answered anonymously, because "
+          "nothing was asked  <-- pinned defect")
+    dead = reconcile([roads, rail], both_items,
+                     probes={road_key: False, rail_key: False})
+    check(dead.probe_failed and dead.untested == sorted([road_key, rail_key])
+          and exit_code(dead) == 2,
+          "a probe that got no definite answer from any service exits 2, not "
+          "0  <-- pinned defect")
+    check(any("no probe got an answer" in line for line in describe(dead))
+          and not any("not one of them answered" in line
+                      for line in describe(dead)),
+          "and says so, instead of claiming that none answered anonymously  "
+          "<-- pinned defect")
+    some = reconcile([roads, rail], both_items,
+                     probes={road_key: True, rail_key: False})
+    check(some.untested == [rail_key] and exit_code(some) == 0
+          and not some.probe_failed and not some.probe_skipped,
+          "one service that could not be asked among others that could still "
+          "exits 0")
+    check(any("1 of 2 service(s) could not be probed" in line
+              for line in describe(some))
+          and any("every service that could be probed refused" in line
+                  for line in describe(some)),
+          "and the summary names how many were left open")
+    full = reconcile([roads, rail], both_items,
+                     probes={road_key: True, rail_key: True})
+    check(full.untested == [] and exit_code(full) == 0
+          and any("not one of them answered" in line
+                  for line in describe(full)),
+          "a run where every probe was conclusive keeps the clean sentence")
+    check(exit_code(reconcile([roads], [], probes={road_key: False})) == 1,
+          "a ghost is still exit 1 when its probe failed")
+    open_ghost = reconcile([roads, rail], both_items[:1],
+                           probes={road_key: True, rail_key: False})
+    check(finding_record(open_ghost.findings[0])["anonymous"] is None,
+          "a ghost whose probe could not ask is recorded as unknown, not as "
+          "not anonymous  <-- pinned defect")
+    check(build_report(SERVER, PORTAL, "q", "t", open_ghost)["unprobed"] == 1,
+          "and the report says how many services were left unprobed")
+    check(csv_rows(build_report(SERVER, PORTAL, "q", "t", open_ghost))[0][7]
+          == "", "and its csv cell is empty  <-- pinned defect")
+    closed_ghost = reconcile([roads, rail], both_items[:1],
+                             probes={road_key: True, rail_key: True})
+    check(csv_rows(build_report(SERVER, PORTAL, "q", "t", closed_ghost))[0][7]
+          == "no", "a ghost that was probed and refused is still no")
+
     raises(lambda: Finding("nonsense", "k"),
            "a finding kind nothing knows about raises rather than sorting as "
            "harmless")
@@ -1985,6 +2234,21 @@ def self_test():
     check(thin["access"] == "private",
           "an item with no access field is recorded private, the safe reading")
     check(thin["url"] == "", "and an item with no url records an empty url")
+    check(sanitize_url("https://svc:PW@gis.example.org/arcgis?token=T#x")
+          == "https://gis.example.org/arcgis",
+          "a user:password@ in a url does not survive sanitising  "
+          "<-- pinned defect")
+    check(sanitize_url("svc:PW@gis.example.org/arcgis")
+          == "gis.example.org/arcgis",
+          "and neither does one on a url typed without its scheme")
+    check(sanitize_url("https://gis.example.org/a@b/x")
+          == "https://gis.example.org/a@b/x" and sanitize_url("") == "",
+          "an @ in the path is left alone, and an empty url stays empty")
+    check(item_record({"id": "x", "url": "https://u:ITEMPW@gis.example.org/"
+                       "arcgis/rest/services/Old/MapServer"})["url"]
+          == "https://gis.example.org/arcgis/rest/services/Old/MapServer",
+          "an item url carrying a password is stored without it  "
+          "<-- pinned defect")
 
     document = build_report(SERVER + "?token=LIVE", PORTAL, "orgid:ORG",
                             "2026-09-16T00:00:00Z", ranked)
@@ -2020,7 +2284,12 @@ def self_test():
           "every csv row has every column")
 
     # ---- formula injection: a text cell must not be run by a spreadsheet
-    check(all(cell(lead + "x") == "'" + lead + "x" for lead in FORMULA_LEADS),
+    LEADS = ("=", "+", "-", "@", "\t", "\r")
+    check(FORMULA_LEADS == LEADS,
+          "the guarded lead characters are exactly = + - @ tab and carriage "
+          "return, written out here so the constant cannot shrink unseen  "
+          "<-- pinned defect")
+    check(all(cell(lead + "x") == "'" + lead + "x" for lead in LEADS),
           "a cell led by =, +, -, @, tab or carriage return gets one "
           "apostrophe  <-- pinned defect")
     check(cell("Hydrants") == "Hydrants" and cell("") == "",
@@ -2032,7 +2301,7 @@ def self_test():
     check(cell("=1+1") == "'=1+1" and cell(cell("=1+1")) == "'=1+1",
           "a cell already led by the apostrophe is not prefixed twice")
     injected = []
-    for lead in FORMULA_LEADS:
+    for lead in LEADS:
         text = lead + "x"
         injected.append({
             "kind": "anonymous-ghost", "severity": 100, "key": text,
@@ -2048,7 +2317,7 @@ def self_test():
             probe_table = list(csv.reader(handle))
     finally:
         shutil.rmtree(probe_dir, ignore_errors=True)
-    check(len(probe_table) == 1 + len(FORMULA_LEADS),
+    check(len(probe_table) == 1 + len(LEADS),
           "six hostile findings read back as six rows under the header, so a "
           "tab or carriage return inside a cell did not split a row")
     for column in ("key", "service_url", "folder", "name", "type", "detail",
@@ -2056,7 +2325,7 @@ def self_test():
                    "item_access"):
         position = CSV_FIELDS.index(column)
         check(all(row[position] == "'" + lead + "x"
-                  for row, lead in zip(probe_table[1:], FORMULA_LEADS)),
+                  for row, lead in zip(probe_table[1:], LEADS)),
               "the %s column is guarded for =, +, -, @, tab and carriage "
               "return  <-- pinned defect" % column)
     check(all(row[CSV_FIELDS.index("severity")] == "100"
@@ -2462,7 +2731,7 @@ def self_test():
         def __init__(self, catalog=None, services=None, folders=None,
                      org="ORG123", token="TESTTOKEN", open_error=None,
                      fail_search_after=None, anonymous=(), login_page=(),
-                     http_error=()):
+                     http_error=(), down=()):
             self.catalog = catalog
             self.services = services if services is not None else []
             self.folders = folders or {}
@@ -2473,6 +2742,7 @@ def self_test():
             self.anonymous = set(anonymous)
             self.login_page = set(login_page)
             self.http_error = dict(http_error)
+            self.down = set(down)
             self.searches = 0
             self.targets = []
             self.posted = []
@@ -2505,6 +2775,8 @@ def self_test():
         def _service(self, path, params):
             """One service answering, or refusing, a probe."""
             name = path.split("/rest/services/", 1)[1]
+            if name in self.down:
+                raise OSError("[Errno 111] Connection refused")
             if name in self.http_error:
                 raise urllib.error.HTTPError(path, self.http_error[name],
                                              "no", {}, None)
@@ -2827,6 +3099,11 @@ def self_test():
         out_json = os.path.join(workdir, "ghosts.json")
         out_csv = os.path.join(workdir, "nested", "ghosts.csv")
         ARGV = ["--server", SERVER, "--portal", PORTAL, "--token", "TESTTOKEN"]
+        os.environ.pop(TOKEN_ENV, None)
+        RAIL_ITEM = {"id": "i5", "title": "Rail", "owner": "ann",
+                     "type": "Map Service", "access": "org",
+                     "created": BASE + 4, "url": REST + "/Transport/Rail/"
+                                                        "MapServer"}
 
         code, seen = captured(lambda: serving(site(), lambda: main(ARGV)))
         check(code == 1, "a run with findings exits 1")
@@ -2852,6 +3129,81 @@ def self_test():
               in seen,
               "a deployment where every service has an item and none answers "
               "anonymously exits 0")
+
+        every = [r + "/MapServer" for r in ("Roads", "Transport/Rail")]
+        every.append("Parcels/FeatureServer")
+        code, seen = captured(lambda: serving(
+            site(anonymous=(), down=every,
+                 catalog=Catalog(SITE_ITEMS[:3] + [RAIL_ITEM])),
+            lambda: main(ARGV)))
+        check(code == 2 and "no probe got an answer" in seen
+              and "not one of them answered" not in seen,
+              "a server whose every service is down for the probe exits 2 and "
+              "does not claim that none answered anonymously  "
+              "<-- pinned defect")
+        code, seen = captured(lambda: serving(
+            site(catalog=Catalog(SITE_ITEMS[:3] + [RAIL_ITEM])),
+            lambda: main(ARGV + ["--no-probe"])))
+        check(code == 0 and "probe was not run" in seen
+              and "not one of them answered" not in seen,
+              "--no-probe with nothing to report does not claim that none "
+              "answered anonymously  <-- pinned defect")
+        np_csv = os.path.join(workdir, "noprobe.csv")
+        captured(lambda: serving(site(), lambda: main(
+            ARGV + ["--no-probe", "--out", np_csv, "--format", "csv",
+                    "--apply"])))
+        with io.open(np_csv, "r", encoding="utf-8", newline="") as handle:
+            np_rows = list(csv.reader(handle))[1:]
+        check(dict((row[0], row[7]) for row in np_rows)
+              == {"ghost": "", "orphan": "no"},
+              "with --no-probe the anonymous column of a ghost is empty, not "
+              "no  <-- pinned defect")
+
+        code, seen = captured(lambda: serving(site(), lambda: main(
+            ARGV + ["--out", workdir, "--format", "csv", "--apply"])))
+        check(code == 2 and "could not write" in seen,
+              "a report that cannot be written exits 2 with a message, not 1 "
+              "with a traceback  <-- pinned defect")
+
+        code, seen = captured(lambda: serving(site(), lambda: main([
+            "--server", "https://svcuser:SVCPW@gis.example.org/arcgis",
+            "--portal", PORTAL + "?token=PORSECRET", "--token", "TESTTOKEN"])))
+        check(code == 1 and "SVCPW" not in seen and "PORSECRET" not in seen,
+              "a password in --server and a token in --portal are not echoed  "
+              "<-- pinned defect")
+        leak_csv = os.path.join(workdir, "leak.csv")
+        code, seen = captured(lambda: serving(
+            site(catalog=Catalog(SITE_ITEMS[:3] + [{
+                "id": "i6", "title": "Old", "owner": "ann",
+                "type": "Map Service", "access": "org", "created": BASE + 5,
+                "url": "https://itemuser:ITEMPW@gis.example.org/arcgis/rest/"
+                       "services/Old/MapServer"}])),
+            lambda: main(ARGV + ["--out", leak_csv, "--format", "csv",
+                                 "--apply"])))
+        with io.open(leak_csv, "r", encoding="utf-8", newline="") as handle:
+            leak_text = handle.read()
+        check("ITEMPW" not in seen and "ITEMPW" not in leak_text
+              and "Old/MapServer" in leak_text,
+              "a password inside a portal item's url reaches neither the "
+              "terminal nor the csv, and the orphan is still reported  "
+              "<-- pinned defect")
+
+        os.environ[TOKEN_ENV] = "ENVTOKEN"
+        try:
+            env_site = site(token="ENVTOKEN")
+            code, seen = captured(lambda: serving(env_site, lambda: main(
+                ["--server", SERVER, "--portal", PORTAL])))
+            flag_site = site()
+            captured(lambda: serving(flag_site, lambda: main(ARGV)))
+        finally:
+            del os.environ[TOKEN_ENV]
+        check(code == 1 and any("token=ENVTOKEN" in t
+                                for t in env_site.targets),
+              "a token in GHOSTSVC_TOKEN is used when --token is absent")
+        check("ENVTOKEN" not in seen, "and is never printed")
+        check(any("token=TESTTOKEN" in t for t in flag_site.targets)
+              and not any("ENVTOKEN" in t for t in flag_site.targets),
+              "--token wins over the environment")
 
         code, seen = captured(lambda: serving(site(), lambda: main(
             ARGV + ["--no-probe"])))
@@ -3064,6 +3416,23 @@ def self_test():
     check(_parse(["--self-test"]).self_test is True, "--self-test parses")
     check(_parse(["--server", SERVER, "--apply"]).apply is True,
           "--apply is read")
+    def usage_exit(argv):
+        noise, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            _parse(argv)
+        except SystemExit as exc:
+            return exc.code
+        finally:
+            sys.stderr = noise
+        return None
+    check(usage_exit(["--server", SERVER, "--unpublish"]) == 64,
+          "an unknown flag is a usage error, exit 64, not argparse's 2  "
+          "<-- pinned defect")
+    check(usage_exit(["--format", "xml"]) == 64
+          and usage_exit(["--num", "x"]) == 64,
+          "so are a bad --format and a non-numeric --num")
+    check(usage_exit(["--server", SERVER]) is None,
+          "and a good command line is not an exit at all")
     refuses(["--server", SERVER, "--ap"],
             "a unique prefix of the write flag is refused, because argparse "
             "would otherwise take --ap for --apply  <-- pinned defect")
@@ -3177,15 +3546,28 @@ def self_test():
 
 # ----------------------------------------------------------------------- cli
 
+class _Parser(argparse.ArgumentParser):
+    """An ArgumentParser whose usage errors exit 64, as the README promises.
+
+    argparse exits 2, and 2 is this tool's code for "the server or the portal
+    could not be read", so a typo in a scheduled job would read as an outage.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(64, "%s: error: %s\n" % (self.prog, message))
+
+
 def _parse(argv):
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="ghostsvc.py",
         description="Reconcile portal items against federated server "
                     "services, and name the anonymously accessible services "
                     "that appear in no sharing report.",
         epilog="Read-only. No flag changes anything on the server or in the "
                "portal. The password is never a flag: export %s or answer the "
-               "prompt." % SECRET_ENV,
+               "prompt. A token is better exported as %s than passed with "
+               "--token." % (SECRET_ENV, TOKEN_ENV),
         allow_abbrev=False,
     )
     ap.add_argument("--server",
@@ -3196,7 +3578,10 @@ def _parse(argv):
     ap.add_argument("--query",
                     help="search query for the item side (default: orgid of "
                          "the signed-in org)")
-    ap.add_argument("--token", help="an existing portal token")
+    ap.add_argument("--token",
+                    help="an existing portal token. Visible in the process "
+                         "list and in shell history: export %s instead."
+                         % TOKEN_ENV)
     ap.add_argument("--username",
                     help="generate a token for this user. The password comes "
                          "from %s or an unechoed prompt, never from argv."
@@ -3243,6 +3628,8 @@ def _authenticate(args):
     """Return a token, or None for an anonymous read."""
     if args.token:
         return args.token
+    if os.environ.get(TOKEN_ENV):
+        return os.environ[TOKEN_ENV]
     if not args.username:
         return None
     secret = read_secret(args.username)
@@ -3307,19 +3694,23 @@ def main(argv=None):
             if not oid:
                 raise RuntimeError("could not read the org id, pass --query")
             query = "orgid:%s" % oid
-        print("portal: %s" % args.portal)
+        print("portal: %s" % sanitize_url(args.portal))
         print("query: %s" % query)
         items, warnings = enumerate_items(
             portal_fetch(args.portal, token, args.insecure), base=query,
             now_ms=None, num=args.num, max_partitions=args.max_partitions,
             echo=lambda line: print(line))
 
-        anonymous, details = set(), {}
+        anonymous, details, probes = set(), {}, {}
         if not args.no_probe:
             print("probing %d service(s) with no token" % len(services))
+            unanswered = set()
             anonymous, details = probe_all(services, args.insecure,
                                            args.timeout,
-                                           echo=lambda line: print(line))
+                                           echo=lambda line: print(line),
+                                           unanswered=unanswered)
+            probes = dict((svc["key"], svc["key"] not in unanswered)
+                          for svc in services)
     except EnumerationIncomplete as exc:
         print("")
         print("error: the reconcile was abandoned, so no ghost list is given.",
@@ -3333,7 +3724,8 @@ def main(argv=None):
         print("error: %s" % exc, file=sys.stderr)
         return 2
 
-    report = reconcile(services, list(items.values()), anonymous, details)
+    report = reconcile(services, list(items.values()), anonymous, details,
+                       probes)
     report.warnings.extend(warnings)
 
     print("")
@@ -3351,7 +3743,13 @@ def main(argv=None):
         else:
             writer = write_csv if args.format == "csv" else write_json
             print("")
-            print("wrote %s" % writer(document, args.out))
+            try:
+                print("wrote %s" % writer(document, args.out))
+            except OSError as exc:
+                print("error: could not write %s: %s. Close the file if it is "
+                      "open in another program, or choose another --out."
+                      % (args.out, exc), file=sys.stderr)
+                return 2
 
     return exit_code(report)
 

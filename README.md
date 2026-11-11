@@ -13,87 +13,152 @@ The service that costs you is usually the one nobody remembers publishing. A tes
 address points, made during a migration two years ago, still serving occupant names over the
 internet to anybody who guesses `/rest/services/Address_TEST/FeatureServer/0/query?where=1=1`.
 
+An excerpt of a real run. The lines marked `...` were left out, and the last line is the real
+footer.
+
 ```
 $ python ghostsvc.py --self-test
 ghostsvc self-test: no server, no portal, no network, no token
 --------------------------------------------------------------------
 PASS  a plain rest url keys to host, folder-less name and type
+...
 PASS  http and https are the same service  <-- pinned defect
 PASS  a short host and its fully qualified name are one machine  <-- pinned defect
+...
 PASS  an /arcgis web adaptor and a /server one front the same service  <-- pinned defect
+...
 PASS  a trailing slash is not a different service  <-- pinned defect
+...
 PASS  an explicit :6443 is the same service as the adaptor in front of it  <-- pinned defect
+...
 PASS  the admin catalog's Name.Type spelling meets the rest catalog's Name/Type  <-- pinned defect
-PASS  case in the folder and service name is folded, because ArcGIS Server will not publish two services that differ only by it  <-- pinned defect
+...
+PASS  case in the folder and service name is folded, because an item says roads/MapServer where the catalog says Roads/MapServer  <-- pinned defect
+...
 PASS  a portal item pointing at layer 3 is an item for that map service  <-- pinned defect
+...
 PASS  a query string is not part of the key, which is what keeps a token out of it  <-- pinned defect
+...
 PASS  a url carrying inline credentials keys to the service without them  <-- pinned defect
+...
 PASS  all eight differences at once still reconcile to one key  <-- pinned defect
 PASS  a map service and a feature service of the same name are two services  <-- pinned defect
+...
 PASS  two federated servers each holding a Roads/MapServer are two services  <-- pinned defect
 PASS  two servers on address literals stay apart, because shortening 10.0.0.5 to its first label would make them both '10'  <-- pinned defect
 PASS  a non-default port is kept, because a second site on :8443 is a second service and merging it would hide a ghost  <-- pinned defect
+...
 PASS  a relative url names no host and is refused rather than keyed to an empty host that matches nothing  <-- pinned defect
+...
 PASS  the LAST rest/services wins, so a reverse proxy mounting the adaptor under a path of its own still keys the service  <-- pinned defect
 ...
 PASS  folders are walked, not just the root  <-- pinned defect
+...
 PASS  a folder that lists itself is visited once, not for ever  <-- pinned defect
+...
 PASS  a catalog deeper than --max-folders refuses instead of walking on  <-- pinned defect
+...
 PASS  the admin catalog's serviceName and folderName give the same keys as the rest catalog  <-- pinned defect
 PASS  and the url reported is always the REST one, because nobody without an admin token can open an admin url  <-- pinned defect
 ...
 PASS  a service description returned with no token is ANONYMOUS  <-- pinned defect
+...
 PASS  a 200 carrying Token Required is NOT anonymous, which is how ArcGIS says no  <-- pinned defect
+...
 PASS  an HTTP 200 whose body is not JSON is NOT anonymous, because that is what an IWA or SAML login page looks like from here  <-- pinned defect
+...
 PASS  a catalog listing is not a service description, so a probe that landed on the wrong url is not counted as anonymous  <-- pinned defect
+...
 PASS  no probe url carries a token, which is the whole experiment  <-- pinned defect
 ...
 PASS  an item whose url differs by scheme, host, adaptor, port, case, a doubled slash, a layer index and a trailing slash still matches its service  <-- pinned defect
 PASS  a running service with no portal item is a GHOST  <-- pinned defect
+...
 PASS  a portal item whose service is not in the catalog is an ORPHAN  <-- pinned defect
+...
 PASS  a service that answers anonymously is a finding even though it has an item  <-- pinned defect
+...
 PASS  a service that answers anonymously AND has no item is the headline finding  <-- pinned defect
+...
 PASS  findings are ranked worst first: anonymous ghost, anonymous, ghost, orphan  <-- pinned defect
+...
 PASS  an empty portal makes every service a ghost, which is why an enumeration that refuses matters  <-- pinned defect
+...
 PASS  an item with no url and an item pointing at a web page are NOT orphans, because neither claims a service  <-- pinned defect
+...
 PASS  an item on the second federated server does not silence the ghost on the first  <-- pinned defect
 ...
+PASS  an item on another domain with the same first label does not hide the ghost, and reads as an orphan  <-- pinned defect
+...
+PASS  a probe that got no definite answer from any service exits 2, not 0  <-- pinned defect
+...
+PASS  a ghost whose probe could not ask is recorded as unknown, not as not anonymous  <-- pinned defect
+...
+PASS  a user:password@ in a url does not survive sanitising  <-- pinned defect
+...
+PASS  the guarded lead characters are exactly = + - @ tab and carriage return, written out here so the constant cannot shrink unseen  <-- pinned defect
 PASS  a cell led by =, +, -, @, tab or carriage return gets one apostrophe  <-- pinned defect
+...
 PASS  a cell already led by the apostrophe is not prefixed twice
+...
 PASS  the key column is guarded for =, +, -, @, tab and carriage return  <-- pinned defect
 PASS  the service_url column is guarded for =, +, -, @, tab and carriage return  <-- pinned defect
 PASS  the folder column is guarded for =, +, -, @, tab and carriage return  <-- pinned defect
+...
 PASS  the item_access column is guarded for =, +, -, @, tab and carriage return  <-- pinned defect
 PASS  severity stays a plain number and kind and anonymous are untouched
 ...
 PASS  exactly 10,000 is the CAP and never a total  <-- pinned defect
+...
 PASS  a short page advances by the ten rows it got, not by the hundred it asked for  <-- pinned defect
+...
 PASS  a one day partition with nothing left to split on REFUSES  <-- pinned defect
 PASS  and the refusal says what an incomplete enumeration would do to the ghost list  <-- pinned defect
 ...
 PASS  the default opener verifies the certificate  <-- pinned defect
+...
 PASS  a service that answers a probe with a login page is NOT reported anonymous  <-- pinned defect
+...
 PASS  the token in the url urllib quoted back is redacted out of the error  <-- pinned defect
+...
 PASS  the portal's error code is reported and the dead token is not  <-- pinned defect
 ...
 PASS  the anonymously reachable service with no item is reported  <-- pinned defect
+...
 PASS  the web map is reported as unreconciled rather than as an orphan  <-- pinned defect
+...
+PASS  --no-probe with nothing to report does not claim that none answered anonymously  <-- pinned defect
+...
+PASS  a report that cannot be written exits 2 with a message, not 1 with a traceback  <-- pinned defect
+PASS  a password in --server and a token in --portal are not echoed  <-- pinned defect
+...
+PASS  a token in GHOSTSVC_TOKEN is used when --token is absent
+...
 PASS  no credential reaches the report file on disk  <-- pinned defect
+...
 PASS  an enumeration that could not be completed exits 2 and reports no ghosts at all  <-- pinned defect
+...
 PASS  and the report from the previous run was not overwritten by a refused one  <-- pinned defect
+...
 PASS  a server whose catalog will not answer exits 2 rather than reporting every item as an orphan  <-- pinned defect
+...
 PASS  a --server with no --portal is a usage error, because every service would be a ghost  <-- pinned defect
 ...
+PASS  an unknown flag is a usage error, exit 64, not argparse's 2  <-- pinned defect
+...
 PASS  a unique prefix of the write flag is refused, because argparse would otherwise take --ap for --apply  <-- pinned defect
+...
 PASS  a plausible-looking --unpublish is refused, because this tool changes nothing  <-- pinned defect
+...
 PASS  the harness records a false check, a missing exception, two wrong exceptions, an argv argparse accepted, two bad enumerations, four bad url comparisons and three bad calls as thirteen failures, so a broken tool turns this self-test red  <-- pinned defect
+...
 --------------------------------------------------------------------
-467 assertions, 0 failed
+516 assertions, 0 failed
 ```
 
 ## Requirements
 
-Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
+Python 3.9 or newer. The self-test ran green on 3.9.25, 3.12 and 3.13. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
 `time`, `argparse`, `datetime`, `getpass`, and `re`, `tempfile`, `shutil` and `runpy` in the self-test. It
 runs on ArcGIS Pro's Python and on a plain `python3`. `arcpy` is not used and the `arcgis` package
 is not needed.
@@ -107,7 +172,9 @@ python ghostsvc.py --self-test
 before you point it at a deployment. It covers the network paths as well as the decisions. The
 catalog walk, the item paging, sign-in, an expired token, an HTTP error, a 200 carrying an ArcGIS
 error envelope and the whole command line all run against a stand-in deployment. That deployment
-answers inside the process, and no socket is opened.
+answers inside the process, and no socket is opened. The shipped self-test therefore never
+exercises the real `urllib` and TLS path. The CSV example below came from a separate, one-off run
+against a local `http.server`, and that stub is not part of this repository.
 
 ## Usage
 
@@ -122,8 +189,9 @@ python ghostsvc.py --server https://gis.example.com/arcgis \
 Keep the answer:
 
 ```
+export GHOSTSVC_TOKEN='...'
 python ghostsvc.py --server https://gis.example.com/arcgis \
-    --portal https://portal.example.com/portal --token TOKEN \
+    --portal https://portal.example.com/portal \
     --out ghosts.csv --format csv --apply
 ```
 
@@ -132,7 +200,7 @@ python ghostsvc.py --server https://gis.example.com/arcgis \
 | `--server` | none | Federated server url. Required. `/rest/services` on the end is trimmed. |
 | `--portal` | none | Portal url. Required, because without the item side every service is a ghost. |
 | `--query` | org id | Search query for the item side. Defaults to `orgid:` of the signed-in org. |
-| `--token` | none | An existing portal token. |
+| `--token` | none | An existing portal token. It sits in the process list and in shell history, so export `GHOSTSVC_TOKEN` instead. The flag wins when both are set. |
 | `--username` | none | Generate a token for this user. |
 | `--admin` | off | Read the catalog from `/admin/services`. Needs a server administrator token, and finds stopped services. |
 | `--no-probe` | off | Skip the anonymity probe. Ghosts and orphans are still reported. |
@@ -148,7 +216,8 @@ python ghostsvc.py --server https://gis.example.com/arcgis \
 
 There is no `--password` flag, and there never will be. `argv` is readable by every process on the
 machine, and it lands in shell history and in scheduler logs. The password comes from
-`GHOSTSVC_PASSWORD` or from an unechoed prompt. No report holds it. Every error message is
+`GHOSTSVC_PASSWORD` or from an unechoed prompt. A token has the same exposure, so it can come
+from `GHOSTSVC_TOKEN` as well as from `--token`. No report holds either. Every error message is
 stripped of it before it is printed, because `generateToken` is a POST and urllib repeats the
 request in some of its exceptions. The token gets the same treatment. A token travels as a query
 parameter, and urllib answers a url it cannot open by quoting that whole url back.
@@ -178,6 +247,12 @@ was installed without web tier authentication, and the permissions page will not
 It counts as anonymous only when the response looks like a service description. A deployment
 behind IWA or SAML answers an unauthenticated request with HTTP 200 and a login page, so "the
 request did not fail" proves nothing.
+
+A probe can also fail to ask. A service that is down, an HTTP 500 and an error nobody recognises
+leave the question open. Those services are recorded as unknown: the `anonymous` column is empty
+and the JSON value is `null`. If no probe got a definite answer, the run says so and exits 2, and
+it never prints that nothing answered anonymously. `--no-probe` leaves every service unknown for
+the same reason.
 
 ## Why not the tools that already exist
 
@@ -223,10 +298,16 @@ federated servers each holding a `Roads/MapServer` stay apart. So do `10.0.0.5` 
 which is why an address literal is never shortened to its first label. So does a second site on
 `:8443`, because only the four ArcGIS defaults, 80, 443, 6080 and 6443, carry no information.
 
-Case is folded, and that is a decision rather than an obvious truth. ArcGIS Server will not
-publish two services in one folder whose names differ only by case, so folding cannot merge two
-real services. Leaving case alone reports `Roads/MapServer` as a ghost because the item says
-`roads/MapServer`. If your deployment somehow holds both, this tool reports them as one.
+Case is folded, and that is a decision rather than an obvious truth. Leaving case alone reports
+`Roads/MapServer` as a ghost because the item says `roads/MapServer`. Esri's documentation does
+not say whether a server may hold two services in one folder that differ only by case, and this
+tool does not assume it. A server that held both would see them reported as one.
+
+The host is folded to its first label for the same reason, and that fold has a limit.
+`gis.alpha.example.org` and `gis.beta.example.net` both fold to `gis`. When the service and the
+item each name a domain and the domains differ, they are different machines: the service is a
+ghost and the item is an orphan. A short host such as `gis` names no domain, so it matches a
+service with that first label whatever its domain.
 
 A url it cannot read is refused rather than guessed at. That covers a portal item page, a query
 endpoint, a url with no host, and a url ending in something that is not an ArcGIS service type.
@@ -235,7 +316,7 @@ a ghost that does not exist.
 
 ## What it refuses
 
-It never changes anything. The calls it makes are `rest/services`, `admin/services`,
+It never changes anything on the server or in the portal. The calls it makes are `rest/services`, `admin/services`,
 `sharing/rest/search`, `portals/self` and `generateToken`, and the self-test asserts that a
 plausible-looking `--unpublish` and `--delete-ghosts` are rejected rather than ignored.
 
@@ -255,21 +336,22 @@ It refuses the same way when the catalog walk cannot finish, and when `--portal`
 ## The CSV file
 
 `--format csv` writes one row per finding per item. A spreadsheet runs a cell that starts with
-`=`, `+`, `-` or `@`, and Excel also treats a leading tab or carriage return that way. Every text
-in this report was typed by someone else: a service name, a folder, an item title, an item owner.
+`=`, `+`, `-` or `@`. OWASP also lists a leading tab and carriage return among the characters a
+cell should not start with. Every text in this report was typed by someone else: a service name, a folder, an item title, an item owner.
 A service named `=cmd` or an item titled `@evil` would otherwise run on the machine of whoever
 opens the report. Every text column therefore gets one leading apostrophe when it starts with one of
 those six characters. `severity` stays a plain number, and `kind` and `anonymous` are written by
-this tool, so they are not touched.
+this tool, so they are not touched. Only the CSV is guarded. The JSON report carries the raw text.
 
 ```
 anonymous-ghost,100,...,'=cmd,MapServer,yes,answered with currentVersion and no token,,,,,
 orphan,20,...,abc,'@evil,'+owner,Feature Service,public
 ```
 
-That is the output of a real run against a local `http.server` stand-in, with a service named
+That is the output of a one-off run against a local `http.server` stand-in, with a service named
 `=cmd` and an item titled `@evil` owned by `+owner`. The self-test has one assertion for each of
-the eleven text columns, and each one tries all six characters. The tool never reads its own CSV
+the eleven text columns, and each one tries all six characters. They are written out as a literal
+tuple in the test, so shrinking the constant in the tool turns the self-test red. The tool never reads its own CSV
 back, so there is nothing to un-prefix. If you load the file into a script, strip one leading
 apostrophe from a cell that starts with `'` followed by one of the six characters.
 
@@ -279,31 +361,35 @@ apostrophe from a cell that starts with `'` followed by one of the six character
 |---|---|
 | 0 | Every service has a portal item and none answered without a token. |
 | 1 | There are findings to review. |
-| 2 | The server or the portal could not be read, so no list is given. |
-| 64 | Usage error. |
+| 2 | The server or the portal could not be read, so no list is given. Also: the report file could not be written, or no service gave a definite probe answer. |
+| 64 | Usage error, including an unknown flag or a bad value. |
 
 ## Limits
 
 - It compares one server against one portal. A deployment with several federated servers needs one
-  run per server, and an item pointing at the other server reads as an orphan in each.
+  run per server, and an item pointing at the other server reads as an orphan in each. Two servers
+  on different domains that share a first label are kept apart only when the item names its
+  domain.
 - ArcGIS Online hosted services are out of scope. Their urls carry the org hash in the position
   this tool treats as the web adaptor name, so two organizations would collide. Use it on
   federated Enterprise servers.
 - A non-default port is part of the key. A site reachable on both `:443` and `:8443` reports the
   `:8443` services as ghosts. The port is in the key the finding prints, so it is visible.
 - `--no-probe` leaves the anonymity column empty. Without the probe the tool reports what the
-  portal and the server disagree about, and nothing about who can read it.
+  portal and the server disagree about, and nothing about who can read it. With no finding it
+  exits 0 and says the probe was not run.
 - The probe is one GET per service, done in sequence. A catalog with thousands of services takes
   as long as that sounds. `--timeout` is per service.
-- A service that is down during the probe is recorded as not anonymous. It may well be anonymous
-  when it comes back. The reason column says the request failed, so those are worth re-running.
+- A service that is down during the probe is recorded as unknown, not as not anonymous. It may
+  well be anonymous when it comes back. The summary counts them. If some answered and some did
+  not, the run still exits 0 when there is no finding, so read that count.
 - Anonymous means the service description answered. It does not mean the data answered. A service
   can return its metadata to anybody and refuse a query, which is unusual but real.
 - ArcGIS Server folders are one level deep. The walk recurses anyway, and stops on a folder it has
   already visited, because a reverse proxy can produce a listing that points back at itself.
-- `/rest/services` lists only started services. `--admin` reads the catalog that lists the
-  stopped ones too, which needs a server administrator token. A stopped service is still a ghost
-  worth knowing about, and it will not answer the probe.
+- Esri's documentation does not say whether `/rest/services` lists a stopped service. `--admin`
+  reads the admin catalog instead, which needs a server administrator token. A stopped service
+  cannot service requests, so it will not answer the probe.
 - It cannot say who published a ghost, or when. ArcGIS Server records that in its own logs, which
   are per-deployment and roll over.
 - An orphan may be a service that is merely stopped rather than gone. Run with `--admin` to tell
@@ -314,14 +400,37 @@ apostrophe from a cell that starts with `'` followed by one of the six character
 - The item side is every item the query matches, not only service items. A list of service item
   types kept in this file would go stale, and a missing type reads as a ghost. On a large
   organization `--query` makes the run faster, at the cost of the items the query leaves out.
-
 - The guard covers the six characters named above. OWASP also lists a leading line feed and the
   full-width forms of `=`, `+`, `-` and `@`, and none of those is guarded. OWASP also warns that a
   quote prefix is unreliable in Excel once the file is saved and opened again. Open the report, do not
   round-trip it.
-- Coverage is 100 percent of branches on Windows, 1554 statements and 308 branches. Linux was run
+- The guard applies to the CSV only. The JSON report carries the raw text.
+- A non-text value in a text column is written as its text, so a `None` would read as `None`.
+  Portal records never carry one, because a missing title or owner becomes an empty string first.
+- Item titles and service names are printed to the terminal as they are, so a control or escape
+  character in published text reaches the console.
+- A token or password inside the url you pass as `--server` or `--portal`, or inside an item's url,
+  is dropped before anything is requested, printed or written. It never authenticates, so use a
+  token.
+- A server that answers with an HTTP redirect to another host gets the token, because `urllib`
+  follows it with the query string intact. Point `--server` and `--portal` only at hosts you trust.
+- The window ends at the client's clock. An item the portal created a moment after that reading is
+  missed, and its service reads as a ghost. That is the safe direction, and a re-run clears it.
+- A run that only has enumeration warnings exits 0 when it has no finding. Missing items can only
+  add false ghosts, but an orphan could go unseen, so read the warnings.
+- A catalog read with a token that cannot see every service reports only the services that token
+  may list. An empty catalog next to an empty portal is a clean result.
+- Probe urls are not percent-encoded. A service or folder name with non-ASCII characters cannot be
+  probed and is recorded as unknown. Esri service names are normally ASCII.
+- `--self-test` makes a temporary directory and a temporary CSV outside `--apply`, and removes them
+  afterwards. Nothing else the tool does writes without `--apply`.
+- The end-to-end runs in the self-test do not cover `generateToken` over a socket, `--admin`,
+  `--insecure`, the date bisect or the 10,000 refusal. Those run only against the in-process
+  stand-in.
+- Coverage is 100 percent of branches on Windows, 1717 statements and 344 branches. Linux was run
   without the coverage module, so the Linux run proves the assertions and not the percentage. The
-  two runs print the same assertion count, 467, because the self-test does not branch on the host.
+  Windows 3.13, Windows 3.9 and Linux 3.12 runs print the same assertion count, 516, because the
+  self-test does not branch on the host.
 
 ## Sources
 
@@ -331,6 +440,20 @@ apostrophe from a cell that starts with `'` followed by one of the six character
   this tool does not guard: https://owasp.org/www-community/attacks/CSV_Injection
 - `search` returns `num` up to 100 and makes only the top 10,000 results reachable by paging:
   https://developers.arcgis.com/rest/users-groups-and-items/search/
+- `generateToken` is a POST to `/sharing/rest/generateToken` taking `username`, `password`,
+  `client`, `referer` and `expiration`:
+  https://developers.arcgis.com/rest/users-groups-and-items/generate-token/
+- `portals/self` returns the organization `id`:
+  https://developers.arcgis.com/rest/users-groups-and-items/portal-self/
+- The admin services listing carries `folderName` and `serviceName`:
+  https://developers.arcgis.com/rest/enterprise-administration/server/services/
+- A stopped service "cannot service any incoming requests":
+  https://developers.arcgis.com/rest/enterprise-administration/server/stopservice/
+
+Not verified against Esri documentation, and stated here as this tool's behaviour: that ArcGIS
+answers a tokenless request with HTTP 200 and an error 499 `Token Required`, that 80, 443, 6080 and
+6443 are the ports to treat as defaults, and whether `/rest/services` lists a stopped service.
+The pages that would settle the first two could not be fetched when this was written.
 
 ## Contributing
 
