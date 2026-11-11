@@ -98,6 +98,8 @@ PASS  a user:password@ in a url does not survive sanitising  <-- pinned defect
 ...
 PASS  a password holding 'Hunter/2pw' is removed whole  <-- pinned defect
 ...
+PASS  an @ in a query parameter is not a credential separator, so the token after it is not printed  <-- pinned defect
+...
 PASS  the guarded lead characters are exactly = + - @ tab and carriage return, written out here so the constant cannot shrink unseen  <-- pinned defect
 PASS  a cell led by =, +, -, @, tab or carriage return gets one apostrophe  <-- pinned defect
 ...
@@ -151,6 +153,9 @@ PASS  and the report from the previous run was not overwritten by a refused one 
 ...
 PASS  a server whose catalog will not answer exits 2 rather than reporting every item as an orphan  <-- pinned defect
 ...
+PASS  a --username run with no password and no terminal exits 2 with a message, not 1 with a traceback  <-- pinned defect
+PASS  an exception nothing foresaw exits 2, not 1 which means findings, and prints its type but not its message, which can carry a url with a token  <-- pinned defect
+...
 PASS  a --server with no --portal is a usage error, because every service would be a ghost  <-- pinned defect
 ...
 PASS  an unknown flag is a usage error, exit 64, not argparse's 2  <-- pinned defect
@@ -161,12 +166,12 @@ PASS  a plausible-looking --unpublish is refused, because this tool changes noth
 ...
 PASS  the harness records a false check, a missing exception, two wrong exceptions, an argv argparse accepted, two bad enumerations, four bad url comparisons and three bad calls as thirteen failures, so a broken tool turns this self-test red  <-- pinned defect
 --------------------------------------------------------------------
-528 assertions, 0 failed
+566 assertions, 0 failed
 ```
 
 ## Requirements
 
-Python 3.9 or newer. The self-test ran green on 3.9.25, 3.12 and 3.13. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
+Python 3.9 or newer. The final file's self-test ran green on 3.11.8, 3.12 and 3.13. An earlier revision ran green on 3.9.25, and no 3.9 interpreter was at hand for the last edits, which use nothing newer than 3.9. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
 `time`, `argparse`, `datetime`, `getpass`, and `re`, `tempfile`, `shutil` and `runpy` in the self-test. It
 runs on ArcGIS Pro's Python and on a plain `python3`. `arcpy` is not used and the `arcgis` package
 is not needed.
@@ -218,6 +223,7 @@ python ghostsvc.py --server https://gis.example.com/arcgis \
 | `--timeout` | `20` | Seconds to wait for one service probe. |
 | `--max-partitions` | `4096` | Give up on the item enumeration rather than bisecting for ever. |
 | `--max-folders` | `512` | Give up on the catalog walk rather than following a folder loop. |
+| `--host-alias` | none | `ITEMHOST=SERVERHOST`. Treat portal items on `ITEMHOST` as items on `SERVERHOST`, for items registered under a public host name. Bare host names only. Repeatable. Used for matching only. |
 | `--insecure` | off | Skip TLS verification. Refused together with `--username`. |
 | `--apply` | off | Write the report file. Without it nothing is written. |
 | `--self-test` | off | Run the offline assertions and exit. |
@@ -354,13 +360,13 @@ this tool, so they are not touched. Only the CSV is guarded. The JSON report car
 
 ```
 kind,severity,key,service_url,folder,name,type,anonymous,detail,item_id,item_title,item_owner,item_type,item_access
-anonymous-ghost,100,127.0.0.1:8811/=cmd/MapServer,http://127.0.0.1:8811/arcgis/rest/services/=cmd/MapServer,,'=cmd,MapServer,yes,answered with currentVersion and no token,,,,,
-orphan,20,127.0.0.1:8811/gone/FeatureServer,http://127.0.0.1:8811/arcgis/rest/services/Gone/FeatureServer,,,,,,abc,'@evil,'+owner,Feature Service,public
+anonymous-ghost,100,127.0.0.1:8831/=cmd/MapServer,http://127.0.0.1:8831/arcgis/rest/services/%3Dcmd/MapServer,,'=cmd,MapServer,yes,answered with currentVersion and no token,,,,,
+orphan,20,127.0.0.1:8831/gone/FeatureServer,http://127.0.0.1:8831/arcgis/rest/services/Gone/FeatureServer,,,,,,abc,'@evil,'+owner,Feature Service,public
 ```
 
 That is the header and two rows of the output of a real run of `main()` over a socket against a
 local `http.server` stand-in, with a service named `=cmd` and an item titled `@evil` owned by
-`+owner`. The orphan's `anonymous` cell is empty because an orphan is never probed. The stand-in
+`+owner`. The service url shows `%3Dcmd` because the tool percent-encodes every catalog name. The `name` column keeps the raw text and is the guarded cell. The orphan's `anonymous` cell is empty because an orphan is never probed. The stand-in
 script is not part of this repository. The self-test has one assertion for each of
 the eleven text columns, and each one tries all six characters. They are written out as a literal
 tuple in the test, so shrinking the constant in the tool turns the self-test red. The tool never reads its own CSV
@@ -373,7 +379,7 @@ apostrophe from a cell that starts with `'` followed by one of the six character
 |---|---|
 | 0 | Every service has a portal item and none answered without a token. Also: `--no-probe` was given and there is no ghost or orphan. |
 | 1 | There are findings to review. A finding wins over an unanswered probe. |
-| 2 | The server or the portal could not be read, so no list is given. Also: the report file could not be written, or there is no finding and at least one service could not be probed. |
+| 2 | The server or the portal could not be read, so no list is given. Also: the report file could not be written, there is no finding and at least one service could not be probed, there is no finding and the enumeration warned, the password could not be asked for, or an exception the tool did not foresee ended the run. |
 | 64 | Usage error, including an unknown flag or a bad value. |
 
 ## Limits
@@ -425,27 +431,34 @@ apostrophe from a cell that starts with `'` followed by one of the six character
 - A token or password inside the url you pass as `--server` or `--portal`, or inside an item's url,
   is dropped before anything is requested, printed or written, including the `referer` posted to
   `generateToken`. The credential is cut at the last `@`, so a password that holds `/`, `?` or `#`
-  goes too. It never authenticates, so use a token. The price is that an `@` in the query string of
-  a url that also has a `:` before it is read as a credential separator, and the url is cut short.
+  goes too. It never authenticates, so use a token. An `@` that follows a `?` or `#` with a `=` or `&`
+  between them is a query parameter, such as `?e=a@b.com`, not a credential separator, so the
+  query is dropped whole and the token in it goes too. A password that holds `?` and then a `=` or
+  `&` before its `@` is read as a query and keeps its first part. An `@` in the path of a url that
+  has a port, such as `host:6443/svc@x`, is read as a credential separator and the host is cut off,
+  so that item reads as unreadable or as a false orphan. Esri service names rarely hold an `@`.
 - A password that the server echoes back in an error is removed in its plain, form-encoded and
   percent-encoded spellings. Any other encoding is not recognised.
 - A server that answers with an HTTP redirect to another host gets the token, because `urllib`
   follows it with the query string intact. The probe follows redirects too, without a token. A
   server that redirects a probe or a catalog call sends the request to whatever host its `Location`
   header names, so point `--server` and `--portal` only at hosts you trust.
-- Folder and service names come from the catalog and are put into the request path. A catalog entry
-  whose name holds `?`, `#` or `../` changes the path requested on the server host, never the host,
-  and the probe strips everything after a `?`.
+- Folder and service names come from the catalog and are percent-encoded one segment at a time before
+  they go into a request path, so a space, a non-ASCII letter, `?` or `#` stays inside its segment.
+  A name that is exactly `..` is not encoded and changes the path requested on the server host,
+  never the host.
 - The window ends at the client's clock. An item the portal created a moment after that reading is
   missed, and its service reads as a ghost. That is the safe direction, and a re-run clears it.
-- A run that only has enumeration warnings exits 0 when it has no finding. Missing items can only
-  add false ghosts, but an orphan could go unseen, so read the warnings. Exit 0 after enumeration
-  warnings means nothing was disproved, not that the org is clean.
+- A run that only has enumeration warnings exits 2 when it has no finding, and says that it is not a
+  clean result. Missing items can only add false ghosts, but an orphan could go unseen, so read the
+  warnings and run again.
 - A catalog read with a token that cannot see every service reports only the services that token
-  may list. An empty catalog next to an empty portal is a clean result.
-- Probe urls are not percent-encoded. A service or folder name with non-ASCII characters cannot be
-  probed and is recorded as unknown. Esri service names are normally ASCII. A non-ASCII or spaced
-  folder name stops the catalog walk with exit 2 instead of skipping that folder.
+  may list. An empty catalog next to an empty portal exits 0 and prints the sentence that every
+  service has an item, which is vacuous for zero services.
+- The item side comes from `search`, and Esri says "The results of a search only contain items that
+  the user has permission to access". A run with a token that cannot see an item reports that
+  item's service as a ghost, although the item exists. Run with a token that sees every item, such
+  as an administrator's, before you act on a ghost.
 - `--self-test` makes a temporary directory and a temporary CSV outside `--apply`, and removes them
   afterwards. Nothing else the tool does writes without `--apply`.
 - The shipped self-test drives the network code through an in-process stand-in, not a socket. The
@@ -460,12 +473,37 @@ apostrophe from a cell that starts with `'` followed by one of the six character
   distinguish a guarded cell from source text that began with an apostrophe.
 - Import the CSV as UTF-8 in Excel. The file has no byte order mark, so a double-click may show
   non-ASCII titles as mojibake.
-- A response in a shape the tool does not expect can end the run with a Python traceback and exit
-  code 1, which is the findings code.
-- Coverage is 100 percent of branches on Windows, 1741 statements and 352 branches. Linux was run
-  without the coverage module, so the Linux run proves the assertions and not the percentage. The
-  Windows 3.13, Windows 3.9 and Linux 3.12 runs print the same assertion count, 528, because the
-  self-test does not branch on the host.
+- A response in a shape the tool does not expect ends the run with one line, `error: unexpected
+  <type>`, and exit 2. The line names the exception type and not its message, because a message
+  from `urllib` can quote a url that carries the token.
+- A `--username` run with no `GHOSTSVC_PASSWORD` and no stdin exits 2 with a message. A Windows
+  console prompt from `getpass` reads the console, not a redirected stdin, and can wait for ever
+  under a scheduler, so set `GHOSTSVC_PASSWORD` there.
+- `--username` posts the password to the scheme of `--portal`. An `http://` portal sends it in clear
+  text. Only `--insecure` is refused with `--username`, so use an `https://` portal.
+- `--token` puts a token on the command line, where other processes can read it. Use
+  `GHOSTSVC_TOKEN`. The token travels in the query string of every request, which is how the Esri
+  `token` parameter works, so it lands in server and proxy access logs.
+- A lone surrogate in a title, from a JSON `\ud800`, fails while the CSV is written. The run ends
+  with `error: unexpected UnicodeEncodeError` and exit 2, and the report file is cut short.
+- `--out` truncates an existing file before it writes, so a write that fails destroys the previous
+  report. Keep the last one under another name.
+- The CSV carries neither the warnings nor the count of unreadable items. They are in the JSON and
+  on the console, so a CSV from a run that exited 2 on warnings looks complete.
+- A cell is guarded by its first character. A text such as the item title `-5` becomes the text
+  `'-5`, never a number. Only `severity` stays numeric. A leading line feed, a full-width `=`, `+`,
+  `-` or `@`, and a formula character after a space, are not guarded.
+- A service type that is not in the tool's list of ArcGIS service types stops the run with exit 2,
+  because the key cannot be built. That is a refusal, not a guess. Add the type to `SERVICE_TYPES`.
+- The self-test parses `--admin` and `--insecure` and runs the admin catalog call and an
+  `insecure` call against the in-process stand-in. It makes no TLS connection and runs no whole
+  `--admin` run, so those two are not exercised end to end. A one-off run of `--token`, `--apply`
+  and `--format csv` over a socket against a local `http.server` produced the CSV example above.
+  That stub is not in this repository, so you cannot repeat that run from it.
+- Coverage is 100 percent of branches on Windows 3.13, 1873 statements and 374 branches, with no
+  line left out. Linux was run without the coverage module, so the Linux run proves the assertions
+  and not the percentage. The Windows 3.11, Windows 3.12, Windows 3.13 and Linux 3.12 runs print the same
+  assertion count, 566, because the self-test does not branch on the host.
 
 ## Sources
 
@@ -473,7 +511,8 @@ apostrophe from a cell that starts with `'` followed by one of the six character
   https://docs.python.org/3/library/csv.html
 - Formula characters and the apostrophe mitigation, including the line feed and full-width cases
   this tool does not guard: https://owasp.org/www-community/attacks/CSV_Injection
-- `search` returns `num` up to 100 and makes only the top 10,000 results reachable by paging:
+- `search` returns `num` up to 100 and makes only the top 10,000 results reachable by paging, and its
+  results only contain items the user has permission to access:
   https://developers.arcgis.com/rest/users-groups-and-items/search/
 - `generateToken` is a POST to `/sharing/rest/generateToken` taking `username`, `password`,
   `client`, `referer` and `expiration`:
@@ -488,7 +527,7 @@ apostrophe from a cell that starts with `'` followed by one of the six character
 Not verified against Esri documentation, and stated here as this tool's behaviour: that ArcGIS
 answers a tokenless request with HTTP 200 and an error 499 `Token Required`, that 80, 443, 6080 and
 6443 are the ports to treat as defaults, and whether `/rest/services` lists a stopped service.
-The pages that would settle the first two could not be fetched when this was written.
+The pages that would settle the first two could not be fetched when this was written, and the Esri ports page failed to load again on 2026-11-11.
 
 ## Contributing
 

@@ -194,11 +194,16 @@ def sanitize_url(url):
         scheme, sep, rest = "", "", raw
     # A password may hold a / ? or # that RFC 3986 would read as the end of the
     # authority. The credential is cut at the last @ before anything else is
-    # split, so none of it is left behind. shortcut: an @ in a query string of
-    # a url that also has a : before it is read as a credential separator, and
-    # the url is cut short, which is the safe way to be wrong.
+    # split, so none of it is left behind. An @ that follows a ? or # and has
+    # a key=value or & between them is a query parameter such as e=a@b.com, not
+    # a credential: cutting there would print the rest of the query, token
+    # included. shortcut: a password that holds ?x=y before its @ is read as a
+    # query and keeps its first part, which no real password does.
     at = rest.rfind("@")
-    if at >= 0 and ":" in rest[:at]:
+    marks = [i for i in (rest.find("?"), rest.find("#")) if i >= 0]
+    in_query = bool(marks) and min(marks) < at and any(
+        c in rest[min(marks):at] for c in "=&")
+    if at >= 0 and ":" in rest[:at] and not in_query:
         rest = rest[at + 1:]
     rest = rest.split("#", 1)[0]
     rest = rest.split("?", 1)[0]
@@ -1397,7 +1402,13 @@ def read_secret(username):
     secret = os.environ.get(SECRET_ENV)
     if secret:
         return secret
-    return getpass.getpass("password for %s (not echoed): " % username)
+    try:
+        return getpass.getpass("password for %s (not echoed): " % username)
+    except EOFError:
+        raise RuntimeError("no password for %s: %s is not set and there is "
+                           "no terminal to ask on. Set %s in the environment "
+                           "of the scheduled job." % (username, SECRET_ENV,
+                                                      SECRET_ENV))
 
 
 def generate_token(url, username, secret, insecure=False):
@@ -1815,6 +1826,21 @@ def self_test():
     check(found[0]["key"] == "gis/roads/MapServer",
           "and the key the reconcile joins on")
     check(flat.asked == [""], "a flat catalog is one request")
+    accented = "Caf" + chr(0xe9)
+    odd = catalog({
+        "": rest_listing([accented, "My Folder"], []),
+        accented: rest_listing([], [("Roads", "MapServer")], accented),
+        "My Folder": rest_listing([], [("Roads", "MapServer")], "My Folder"),
+    })
+    check(sorted(svc["url"] for svc in walk_catalog(odd, SERVER))
+          == [REST + "/Caf%C3%A9/Roads/MapServer",
+              REST + "/My%20Folder/Roads/MapServer"],
+          "a folder with a space or a non-ASCII letter is walked and its "
+          "services get percent-encoded urls, so it neither stops the run nor "
+          "goes unprobed")
+    check(_quoted_path("Caf" + chr(0xe9) + "/x y?#") == "Caf%C3%A9/x%20y%3F%23",
+          "a catalog path is encoded one segment at a time, and ? and # never "
+          "reach the request as syntax")
 
     nested = catalog({
         "": rest_listing(["Transport", "Utilities"], [("Roads", "MapServer")]),
@@ -2111,6 +2137,56 @@ def self_test():
           "doubled slash, a layer index and a trailing slash still matches its "
           "service  <-- pinned defect")
 
+    public_url = "https://maps.example.net/arcgis/rest/services/Roads/MapServer"
+    split = reconcile([roads], [item("i1", public_url)])
+    check(sorted(f.kind for f in split.findings) == ["ghost", "orphan"],
+          "an item registered under a public host name reads as an orphan "
+          "beside a ghost, which is why --host-alias exists")
+    amap = parse_host_aliases(["Maps.Example.NET = gis.example.org"])
+    check(amap == {"maps.example.net": "gis.example.org"},
+          "--host-alias pairs are parsed, trimmed and lowercased")
+    check(parse_host_aliases([]) == {} and parse_host_aliases(None) == {},
+          "and no pair at all is an empty map")
+    joined = reconcile([roads], [item("i1", public_url)], aliases=amap)
+    check(joined.findings == [] and joined.matched == 1,
+          "an aliased item matches the service on the server host, so the "
+          "ghost and the orphan both go")
+    check(joined.items[0]["url"] == public_url,
+          "and the item keeps the url it has, because the alias is used for "
+          "matching only")
+    other = reconcile([roads], [item("i1", public_url)],
+                      aliases={"maps.example.net": "gis.other.org"})
+    check(sorted(f.kind for f in other.findings) == ["ghost", "orphan"],
+          "an alias to a host in another domain does not match a service "
+          "there")
+    check(alias_url(public_url, amap) == REST + "/Roads/MapServer",
+          "alias_url swaps the host and keeps the path")
+    check(alias_url("http://MAPS.example.net.:6443/x/y", amap)
+          == "http://gis.example.org:6443/x/y",
+          "keeps the port and the scheme, and ignores case and a trailing "
+          "dot")
+    check(alias_url("maps.example.net/x", amap) == "https://gis.example.org/x",
+          "a url with no scheme gets https")
+    check(alias_url("https://other.example.net/x", amap)
+          == "https://other.example.net/x",
+          "a host with no alias is returned as it was")
+    check(alias_url(public_url, {}) == public_url
+          and alias_url(None, amap) is None and alias_url("", amap) == "",
+          "no alias map, no url and an empty url are returned as they were")
+    check(alias_url("https://maps.example.net:abc/x", amap)
+          == "https://maps.example.net:abc/x",
+          "a url with a port that is not a number is returned as it was")
+    for bad_pair in ("nonsense", "a=b/c", "=x", "x=", "https://a=b",
+                     "u:PW@h=x"):
+        refused = ""
+        try:
+            parse_host_aliases([bad_pair])
+        except ValueError as exc:
+            refused = "%s" % exc
+        check(bool(refused) and "PW" not in refused,
+              "a --host-alias of %r is refused, and a credential in it is not "
+              "echoed" % bad_pair)
+
     ghost = reconcile([roads, rail], [item("i1", REST + "/Roads/MapServer")])
     check(len(ghost.findings) == 1 and ghost.findings[0].kind == "ghost",
           "a running service with no portal item is a GHOST  "
@@ -2380,6 +2456,23 @@ def self_test():
     check(sanitize_url("gis.example.org/a?next=https://x/y")
           == "gis.example.org/a",
           "a :// inside a query string is not taken for a scheme")
+    check(sanitize_url("https://h:6443/arcgis/rest?u=a@b.com&token=SECRET")
+          == "https://h:6443/arcgis/rest",
+          "an @ in a query parameter is not a credential separator, so the "
+          "token after it is not printed  <-- pinned defect")
+    check(sanitize_url("https://h/x?time=1:2&e=a@b&token=SECRET")
+          == "https://h/x",
+          "and a : earlier in the query does not make it one  "
+          "<-- pinned defect")
+    check(sanitize_url("https://u:PW@h/x?e=a@b&token=SECRET") == "https://h/x",
+          "a real user:password@ is still removed beside a query @")
+    check(sanitize_url("https://h:6443/x#f=1@2&token=SECRET")
+          == "https://h:6443/x",
+          "an @ in a fragment is read the same way  <-- pinned defect")
+    check(sanitize_url("https://h:6443/arcgis/rest/services/Parcels@2024/"
+                       "MapServer") == "https://2024/MapServer",
+          "known limit: an @ in the path of a url that has a port is read as "
+          "a credential separator and the host is cut off")
     check(item_record({"id": "x", "url": "https://u:ITEMPW@gis.example.org/"
                        "arcgis/rest/services/Old/MapServer"})["url"]
           == "https://gis.example.org/arcgis/rest/services/Old/MapServer",
@@ -2504,6 +2597,12 @@ def self_test():
     check(any("may have an item after all" in line
               for line in describe(warned)),
           "and says what that does to the ghost list  <-- pinned defect")
+    quiet_warned = Report([], ranked.services, ranked.items, [],
+                          ["the total moved"])
+    check(any("not a clean result" in line for line in describe(quiet_warned))
+          and exit_code(quiet_warned) == 2,
+          "a run with no finding and an enumeration warning says it is not "
+          "clean and exits 2, not 0  <-- pinned defect")
 
     check(printable("plain", "cp1252") == "plain",
           "an ascii title passes through a cp1252 console")
@@ -2782,6 +2881,9 @@ def self_test():
           "and it is the ids that are unique, not merely the count")
     raises(lambda: crawl_partition(lambda q, s, n: ["not", "a", "page"], "q"),
            "a fetch returning something that is not a search response raises")
+    raises(lambda: crawl_partition(
+        lambda q, s, n: {"total": 1, "results": ["not an object"]}, "q"),
+        "a search result that is not an object raises")
     raises(lambda: crawl_partition(
         lambda q, s, n: {"total": 1, "results": [{"title": "no id"}]}, "q"),
         "a search result with no id raises rather than being keyed under None")
@@ -3135,6 +3237,19 @@ def self_test():
         catalog_fetch(SERVER, "T"), SERVER)),
         "the same guard covers the server catalog, because it is one guard "
         "and not one per caller")
+
+    check(_error_text({"error": {"code": 499, "message": "Token Required"}})
+          == "499 Token Required",
+          "the portal and services directory error shape is read")
+    check(_error_text({"error": "Service unavailable"})
+          == "Service unavailable",
+          "and so is a bare string under error, which a proxy sends")
+    check(_error_text({"status": "error", "code": 500,
+                       "messages": ["bad one", "worse one"]})
+          == "500 bad one; worse one",
+          "and so is the Administrator API shape")
+    check(_error_text({"status": "ok", "services": []}) == "",
+          "an answer that says nothing went wrong gives no message")
 
     check(serving(site(), lambda: generate_token(PORTAL, "gis_admin",
                                                  "hunter2")) == "TESTTOKEN",
@@ -3522,6 +3637,78 @@ def self_test():
               "a portal that changed mid-crawl still reports, with a warning "
               "over the ghost list")
 
+        bad_csv = os.path.join(workdir, "surrogate.csv")
+        with io.open(bad_csv, "w", encoding="utf-8") as handle:
+            handle.write(u"previous report")
+        lone = {"id": "i7", "title": "Lone " + chr(0xd800), "owner": "ann",
+                "type": "Map Service", "access": "org", "created": BASE + 6,
+                "url": REST + "/Gone/MapServer"}
+        code, seen = captured(lambda: serving(
+            site(catalog=Catalog(SITE_ITEMS[:3] + [lone])), lambda: main(
+                ARGV + ["--out", bad_csv, "--format", "csv", "--apply"])))
+        with io.open(bad_csv, "r", encoding="utf-8") as handle:
+            left = handle.read()
+        check(code == 2 and "unexpected UnicodeEncodeError" in seen,
+              "a title the csv cannot encode exits 2 with one line, not 1 "
+              "with a traceback  <-- pinned defect")
+        check("previous report" not in left,
+              "and the earlier file is truncated, which the README states")
+
+        pub_rail = {"id": "i5", "title": "Rail", "owner": "ann",
+                    "type": "Map Service", "access": "org", "created": BASE + 4,
+                    "url": "https://maps.example.net/arcgis/rest/services/"
+                           "Transport/Rail/MapServer"}
+        alias_catalog = Catalog(SITE_ITEMS[:3] + [pub_rail])
+        code, seen = captured(lambda: serving(
+            site(anonymous=(), catalog=alias_catalog), lambda: main(ARGV)))
+        check(code == 1 and "orphan" in seen,
+              "an item registered under another host name is an orphan and "
+              "its service a ghost until --host-alias says otherwise")
+        code, seen = captured(lambda: serving(
+            site(anonymous=(), catalog=alias_catalog), lambda: main(
+                ARGV + ["--host-alias", "maps.example.net=gis.example.org"])))
+        check(code == 0 and "Every service on the server has a portal item"
+              in seen,
+              "--host-alias maps.example.net=gis.example.org matches it, end "
+              "to end, and the run exits 0")
+        code, seen = captured(lambda: main(
+            ARGV + ["--host-alias", "maps.example.net"]))
+        check(code == 64 and "--host-alias" in seen,
+              "a --host-alias that is not a pair is a usage error")
+
+        os.environ.pop(SECRET_ENV, None)
+        real_getpass = getpass.getpass
+
+        def no_terminal(prompt):
+            raise EOFError()
+
+        getpass.getpass = no_terminal
+        try:
+            code, seen = captured(lambda: serving(site(), lambda: main(
+                ARGV[:4] + ["--username", "gis_admin"])))
+        finally:
+            getpass.getpass = real_getpass
+        check(code == 2 and "no password for gis_admin" in seen
+              and "Traceback" not in seen,
+              "a --username run with no password and no terminal exits 2 "
+              "with a message, not 1 with a traceback  <-- pinned defect")
+
+        real_reconcile = reconcile
+
+        def broken_reconcile(*args, **kwargs):
+            raise KeyError("TESTTOKEN")
+
+        globals()["reconcile"] = broken_reconcile
+        try:
+            code, seen = captured(lambda: serving(site(), lambda: main(ARGV)))
+        finally:
+            globals()["reconcile"] = real_reconcile
+        check(code == 2 and "unexpected KeyError" in seen
+              and "TESTTOKEN" not in seen,
+              "an exception nothing foresaw exits 2, not 1 which means "
+              "findings, and prints its type but not its message, which can "
+              "carry a url with a token  <-- pinned defect")
+
         # the usage errors that never reach a network
         code, seen = captured(lambda: main([]))
         check(code == 64 and "--server is required" in seen,
@@ -3815,6 +4002,24 @@ def _authenticate(args):
 
 
 def main(argv=None):
+    """Run the tool. Exit 0 clean, 1 findings, 2 unsure, 64 usage.
+
+    Any exception the checks below did not foresee is reported on one line and
+    exits 2. An uncaught one would exit 1 with a traceback, and 1 is the code
+    for findings, so a scheduler would read a crash as a ghost list.
+    """
+    try:
+        return _main(argv)
+    except Exception as exc:
+        # Only the type is printed. The message of an exception raised inside
+        # urllib can quote a url, and the url carries the token.
+        print("error: unexpected %s. This is a bug here or a response in a "
+              "shape this tool does not know. No ghost list is given."
+              % type(exc).__name__, file=sys.stderr)
+        return 2
+
+
+def _main(argv):
     args = _parse(sys.argv[1:] if argv is None else argv)
 
     if args.self_test:
