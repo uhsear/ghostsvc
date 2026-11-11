@@ -100,6 +100,8 @@ PASS  a password holding 'Hunter/2pw' is removed whole  <-- pinned defect
 ...
 PASS  an @ in a query parameter is not a credential separator, so the token after it is not printed  <-- pinned defect
 ...
+PASS  an @ that is the first thing in a query or fragment does not expose the token after it: https://h:6443/arcgis/rest/services/Roads/MapServer  <-- pinned defect
+...
 PASS  the guarded lead characters are exactly = + - @ tab and carriage return, written out here so the constant cannot shrink unseen  <-- pinned defect
 PASS  a cell led by =, +, -, @, tab or carriage return gets one apostrophe  <-- pinned defect
 ...
@@ -166,14 +168,14 @@ PASS  a plausible-looking --unpublish is refused, because this tool changes noth
 ...
 PASS  the harness records a false check, a missing exception, two wrong exceptions, an argv argparse accepted, two bad enumerations, four bad url comparisons and three bad calls as thirteen failures, so a broken tool turns this self-test red  <-- pinned defect
 --------------------------------------------------------------------
-566 assertions, 0 failed
+569 assertions, 0 failed
 ```
 
 ## Requirements
 
-Python 3.9 or newer. The final file's self-test ran green on 3.11.8, 3.12 and 3.13. An earlier revision ran green on 3.9.25, and no 3.9 interpreter was at hand for the last edits, which use nothing newer than 3.9. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
+Python 3.9 or newer. The final file's self-test ran green, with 569 assertions, on Windows 3.9.25, 3.10.20, 3.11.15, 3.12 and 3.13, and on Linux 3.12.3. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
 `time`, `argparse`, `datetime`, `getpass`, and `re`, `tempfile`, `shutil` and `runpy` in the self-test. It
-runs on ArcGIS Pro's Python and on a plain `python3`. `arcpy` is not used and the `arcgis` package
+runs on a plain `python3`. It was not run on ArcGIS Pro's own interpreter, which is a 3.9 build, so that is untested here. `arcpy` is not used and the `arcgis` package
 is not needed.
 
 ```
@@ -377,7 +379,7 @@ apostrophe from a cell that starts with `'` followed by one of the six character
 
 | Code | Meaning |
 |---|---|
-| 0 | Every service has a portal item and none answered without a token. Also: `--no-probe` was given and there is no ghost or orphan. |
+| 0 | Every service has a portal item and none answered without a token. Also: `--no-probe` was given and there is no ghost or orphan. That second case says anonymity was not tested, so read the exit code as an answer about ghosts and orphans only. |
 | 1 | There are findings to review. A finding wins over an unanswered probe. |
 | 2 | The server or the portal could not be read, so no list is given. Also: the report file could not be written, there is no finding and at least one service could not be probed, there is no finding and the enumeration warned, the password could not be asked for, or an exception the tool did not foresee ended the run. |
 | 64 | Usage error, including an unknown flag or a bad value. |
@@ -404,7 +406,7 @@ apostrophe from a cell that starts with `'` followed by one of the six character
   not, the run exits 2 when there is no finding and 1 when there is one, so read that count.
 - Anonymous means the service description answered. It does not mean the data answered. A service
   can return its metadata to anybody and refuse a query, which is unusual but real.
-- The walk recurses to any depth, whatever the server allows, and stops on a folder it has already
+- The walk goes through every folder up to `--max-folders`, whatever depth the server allows, and stops on a folder it has already
   visited, because a reverse proxy can produce a listing that points back at itself.
 - Esri's documentation does not say whether `/rest/services` lists a stopped service. `--admin`
   reads the admin catalog instead, which needs a server administrator token. A stopped service
@@ -431,8 +433,7 @@ apostrophe from a cell that starts with `'` followed by one of the six character
 - A token or password inside the url you pass as `--server` or `--portal`, or inside an item's url,
   is dropped before anything is requested, printed or written, including the `referer` posted to
   `generateToken`. The credential is cut at the last `@`, so a password that holds `/`, `?` or `#`
-  goes too. It never authenticates, so use a token. An `@` that follows a `?` or `#` with a `=` or `&`
-  between them is a query parameter, such as `?e=a@b.com`, not a credential separator, so the
+  goes too. It never authenticates, so use a token. An `@` that follows a `?` or `#` is a query parameter, such as `?e=a@b.com` or `?u@x.com&token=T`, not a credential separator, when a `/` came before the `?` or a `=` or `&` sits between them, so the
   query is dropped whole and the token in it goes too. A password that holds `?` and then a `=` or
   `&` before its `@` is read as a query and keeps its first part. An `@` in the path of a url that
   has a port, such as `host:6443/svc@x`, is read as a credential separator and the host is cut off,
@@ -469,6 +470,11 @@ apostrophe from a cell that starts with `'` followed by one of the six character
 - These three Esri behaviours rest on observation and are not cited to an Esri page: the HTTP 200
   with error 499 `Token Required`, the default ports 80, 443, 6080 and 6443, and whether
   `/rest/services` lists a stopped service.
+- The socket-level CSV example came from a stub that is not shipped, so the shipped self-test uses an in-process stand-in.
+- The tool does not read its CSV back, so consumers must strip one leading apostrophe themselves.
+- A zero-service server with a portal that holds no service items exits 0 and says the probe was not run, although it ran. A wrong `--server` that answers an empty listing looks the same as a clean org.
+- An error line printed to stderr is not re-encoded. A portal message with characters outside the console code page can turn into `unexpected UnicodeEncodeError` on a redirected Windows console. The exit code stays correct.
+- A token or password given in `--server` is cut from the output, but `--token` itself stays on the command line. A scheduled job should use `GHOSTSVC_TOKEN` only.
 - A cell with leading whitespace before a formula character is not guarded. The strip rule cannot
   distinguish a guarded cell from source text that began with an apostrophe.
 - Import the CSV as UTF-8 in Excel. The file has no byte order mark, so a double-click may show
@@ -500,10 +506,10 @@ apostrophe from a cell that starts with `'` followed by one of the six character
   `--admin` run, so those two are not exercised end to end. A one-off run of `--token`, `--apply`
   and `--format csv` over a socket against a local `http.server` produced the CSV example above.
   That stub is not in this repository, so you cannot repeat that run from it.
-- Coverage is 100 percent of branches on Windows 3.13, 1873 statements and 374 branches, with no
+- Coverage is 100 percent of branches on Windows 3.13, 1875 statements and 376 branches, with no
   line left out. Linux was run without the coverage module, so the Linux run proves the assertions
-  and not the percentage. The Windows 3.11, Windows 3.12, Windows 3.13 and Linux 3.12 runs print the same
-  assertion count, 566, because the self-test does not branch on the host.
+  and not the percentage. The Windows 3.9, 3.10, 3.11, 3.12 and 3.13 runs and the Linux 3.12 run print the same
+  assertion count, 569, because the self-test does not branch on the host.
 
 ## Sources
 

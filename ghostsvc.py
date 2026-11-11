@@ -201,8 +201,11 @@ def sanitize_url(url):
     # query and keeps its first part, which no real password does.
     at = rest.rfind("@")
     marks = [i for i in (rest.find("?"), rest.find("#")) if i >= 0]
-    in_query = bool(marks) and min(marks) < at and any(
-        c in rest[min(marks):at] for c in "=&")
+    # A / before the first ? or # means the authority has ended, so the @ after
+    # it sits in the query even when no = or & precedes it (?u@x.com&token=T).
+    in_query = bool(marks) and min(marks) < at and (
+        "/" in rest[:min(marks)] or any(
+            c in rest[min(marks):at] for c in "=&"))
     if at >= 0 and ":" in rest[:at] and not in_query:
         rest = rest[at + 1:]
     rest = rest.split("#", 1)[0]
@@ -1132,7 +1135,9 @@ def describe(report):
             out.append("No finding, but the enumeration warned above, so this "
                        "is not a clean result. Run again.")
         elif report.probe_skipped:
-            out.append("Every service on the server has a portal item.")
+            out.append("Every service on the server has a portal item, but "
+                       "--no-probe was given, so nothing is known about who "
+                       "can read them.")
         elif report.probe_failed:
             out.append("Every service on the server has a portal item, but no "
                        "probe got an answer, so nothing is known about who "
@@ -2464,6 +2469,15 @@ def self_test():
           == "https://h/x",
           "and a : earlier in the query does not make it one  "
           "<-- pinned defect")
+    for lead_at in ("https://h:6443/arcgis/rest/services/Roads/MapServer"
+                    "?u@x.com&token=SECRET",
+                    "https://h/x?u@x.com/&token=SECRET",
+                    "https://h:6443/x#u@x.com&token=SECRET"):
+        check("SECRET" not in sanitize_url(lead_at)
+              and sanitize_url(lead_at).startswith("https://h"),
+              "an @ that is the first thing in a query or fragment does not "
+              "expose the token after it: %s  <-- pinned defect"
+              % sanitize_url(lead_at))
     check(sanitize_url("https://u:PW@h/x?e=a@b&token=SECRET") == "https://h/x",
           "a real user:password@ is still removed beside a query @")
     check(sanitize_url("https://h:6443/x#f=1@2&token=SECRET")
@@ -3418,6 +3432,7 @@ def self_test():
             site(catalog=Catalog(SITE_ITEMS[:3] + [RAIL_ITEM])),
             lambda: main(ARGV + ["--no-probe"])))
         check(code == 0 and "probe was not run" in seen
+              and "--no-probe was given, so nothing is known" in seen
               and "not one of them answered" not in seen,
               "--no-probe with nothing to report does not claim that none "
               "answered anonymously  <-- pinned defect")
