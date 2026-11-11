@@ -34,9 +34,11 @@ also makes a temporary directory and removes it again.)
         --portal https://portal.example.com/portal --username gis_admin \\
         --out ghosts.csv --format csv --apply
 
-Exit codes: 0 every service has an item and none answered anonymously, 1 there
-are findings to review, 2 the server or the portal could not be read, the
-report could not be written, or no service could be probed, 64 usage error.
+Exit codes: 0 every service has an item and none answered anonymously (or
+--no-probe was given and no ghost or orphan was found), 1 there are findings to
+review, 2 the server or the portal could not be read, the report could not be
+written, or a service could not be probed and nothing else was found, 64 usage
+error.
 """
 
 from __future__ import print_function
@@ -178,11 +180,20 @@ def sanitize_url(url):
     months.
     """
     raw = "%s" % (url or "")
-    raw = raw.split("#", 1)[0]
-    raw = raw.split("?", 1)[0]
     scheme, sep, rest = raw.partition("://")
-    if not sep:
-        scheme, rest = "", raw
+    if not scheme.isalnum():
+        # No scheme: a "://" inside a query string is not one.
+        scheme, sep, rest = "", "", raw
+    # A password may hold a / ? or # that RFC 3986 would read as the end of the
+    # authority. The credential is cut at the last @ before anything else is
+    # split, so none of it is left behind. shortcut: an @ in a query string of
+    # a url that also has a : before it is read as a credential separator, and
+    # the url is cut short, which is the safe way to be wrong.
+    at = rest.rfind("@")
+    if at >= 0 and ":" in rest[:at]:
+        rest = rest[at + 1:]
+    rest = rest.split("#", 1)[0]
+    rest = rest.split("?", 1)[0]
     authority, slash, path = rest.partition("/")
     return scheme + sep + authority.rpartition("@")[2] + slash + path
 
@@ -922,7 +933,10 @@ def reconcile(services, items, anonymous=(), details=None, probes=None):
     for key in sorted(by_key):
         for raw in by_key[key]:
             if id(raw) not in claimed:
-                findings.append(Finding("orphan", key, None, [raw]))
+                # An orphan names a service this server never listed, so
+                # it is never probed and its anonymity is unknown.
+                findings.append(Finding("orphan", key, None, [raw],
+                                        tested=False))
     return Report(findings, list(services), list(items), unreadable,
                   probes=probes)
 
@@ -1066,13 +1080,15 @@ def describe(report):
 def exit_code(report):
     """0 when there is nothing to look at, 1 when there is, 2 when unsure.
 
-    A probe that ran and got no definite answer from any service proves
-    nothing, so it cannot be a clean result. Findings still win: a ghost is
-    worth reading whether or not the probe worked.
+    A probe that left even one service without a definite answer cannot give a
+    clean result, because that service might be open to everyone. Findings
+    still win: a ghost is worth reading whether or not the probe worked.
+    A run that skipped the probe on request (--no-probe) answered the only
+    question it was asked, so it is not unsure.
     """
     if report.findings:
         return 1
-    return 2 if report.probe_failed else 0
+    return 2 if report.untested and not report.probe_skipped else 0
 
 
 # ------------------------------------------------------------------- plumbing
@@ -1099,7 +1115,13 @@ def redact(text, *secrets):
             # Coerced because this runs inside an exception handler, where a
             # secret that arrived as anything but a string used to raise
             # TypeError and throw away the redaction with it.
-            out = out.replace("%s" % (secret,), REDACTED)
+            plain = "%s" % (secret,)
+            # The form-encoded and percent-encoded spellings too: a server
+            # that echoes the POST body back quotes a password like p@ss as
+            # p%40ss.
+            for spelling in (plain, urllib.parse.quote_plus(plain),
+                             urllib.parse.quote(plain, safe="")):
+                out = out.replace(spelling, REDACTED)
     return out
 
 
@@ -1281,7 +1303,7 @@ def generate_token(url, username, secret, insecure=False):
         "username": username,
         "password": secret,
         "client": "referer",
-        "referer": url,
+        "referer": sanitize_url(url),
         "expiration": 60,
     }, insecure=insecure, post=True, secret=secret)
     token = body.get("token")
@@ -2169,15 +2191,18 @@ def self_test():
           "<-- pinned defect")
     some = reconcile([roads, rail], both_items,
                      probes={road_key: True, rail_key: False})
-    check(some.untested == [rail_key] and exit_code(some) == 0
+    check(some.untested == [rail_key] and exit_code(some) == 2
           and not some.probe_failed and not some.probe_skipped,
-          "one service that could not be asked among others that could still "
-          "exits 0")
+          "one service that could not be asked, with no finding, exits 2 "
+          "because it might be open to everyone  <-- pinned defect")
     check(any("1 of 2 service(s) could not be probed" in line
               for line in describe(some))
           and any("every service that could be probed refused" in line
                   for line in describe(some)),
           "and the summary names how many were left open")
+    check(exit_code(reconcile([roads, rail], both_items[:1],
+                              probes={road_key: True, rail_key: False})) == 1,
+          "a finding still exits 1 when a probe was left open")
     full = reconcile([roads, rail], both_items,
                      probes={road_key: True, rail_key: True})
     check(full.untested == [] and exit_code(full) == 0
@@ -2244,6 +2269,15 @@ def self_test():
     check(sanitize_url("https://gis.example.org/a@b/x")
           == "https://gis.example.org/a@b/x" and sanitize_url("") == "",
           "an @ in the path is left alone, and an empty url stays empty")
+    for dirty_pw in ("Hunter/2pw", "Hun?ter", "Hun#ter", "Hu:nt@er",
+                     "/", "a/b/c"):
+        check(sanitize_url("http://svc:%s@gis.example.org/arcgis"
+                           % dirty_pw) == "http://gis.example.org/arcgis",
+              "a password holding %r is removed whole  <-- pinned defect"
+              % dirty_pw)
+    check(sanitize_url("gis.example.org/a?next=https://x/y")
+          == "gis.example.org/a",
+          "a :// inside a query string is not taken for a scheme")
     check(item_record({"id": "x", "url": "https://u:ITEMPW@gis.example.org/"
                        "arcgis/rest/services/Old/MapServer"})["url"]
           == "https://gis.example.org/arcgis/rest/services/Old/MapServer",
@@ -2392,6 +2426,11 @@ def self_test():
     check(is_http_url(None) is False, "a missing url is refused")
     check(redact("token=SECRET1", "SECRET1") == "token=" + REDACTED,
           "a secret is removed before printing")
+    check(redact("password=p%40ss+w%2Frd%261 and p%40ss%20w%2Frd%261 and "
+                 "p@ss w/rd&1", "p@ss w/rd&1") == "password=%s and %s and %s"
+          % (REDACTED, REDACTED, REDACTED),
+          "a password the server echoes back form-encoded or percent-encoded "
+          "is redacted too  <-- pinned defect")
     check(redact("a=1", None, "") == "a=1",
           "a redact with nothing to remove leaves the text alone")
     check(redact("id 7 failed", 7) == "id %s failed" % REDACTED,
@@ -3037,6 +3076,16 @@ def self_test():
     check("hunter2" not in hidden,
           "and the password it carried is not in the message  "
           "<-- pinned defect")
+    refered = site()
+    serving(refered, lambda: generate_token(
+        "https://svc:PORTPW@gis.example.org/portal?token=PORTTOK", "gis_admin",
+        "hunter2"))
+    check(refered.posted and not any("PORTPW" in b or "PORTTOK" in b
+                                     for b in refered.posted)
+          and "referer=https%3A%2F%2Fgis.example.org%2Fportal" in
+          refered.posted[0],
+          "the referer posted to the portal carries no password and no token "
+          "from the --portal url  <-- pinned defect")
     dead = fails(lambda: serving(site(fail_search_after=0), lambda:
                                  enumerate_items(
                                      portal_fetch(PORTAL, "TESTTOKEN"),
@@ -3129,6 +3178,13 @@ def self_test():
               in seen,
               "a deployment where every service has an item and none answers "
               "anonymously exits 0")
+        code, seen = captured(lambda: serving(
+            site(anonymous=(), down=["Roads/MapServer"],
+                 catalog=Catalog(SITE_ITEMS[:3] + [RAIL_ITEM])),
+            lambda: main(ARGV)))
+        check(code == 2 and "1 of 3 service(s) could not be probed" in seen,
+              "one service down for the probe and no finding exits 2, not 0  "
+              "<-- pinned defect")
 
         every = [r + "/MapServer" for r in ("Roads", "Transport/Rail")]
         every.append("Parcels/FeatureServer")
@@ -3155,9 +3211,23 @@ def self_test():
         with io.open(np_csv, "r", encoding="utf-8", newline="") as handle:
             np_rows = list(csv.reader(handle))[1:]
         check(dict((row[0], row[7]) for row in np_rows)
-              == {"ghost": "", "orphan": "no"},
-              "with --no-probe the anonymous column of a ghost is empty, not "
-              "no  <-- pinned defect")
+              == {"ghost": "", "orphan": ""},
+              "with --no-probe the anonymous column of a ghost and of an "
+              "orphan is empty, not no  <-- pinned defect")
+        or_csv = os.path.join(workdir, "orphan.csv")
+        or_json = os.path.join(workdir, "orphan.json")
+        for target, fmt in ((or_csv, "csv"), (or_json, "json")):
+            captured(lambda: serving(site(), lambda: main(
+                ARGV + ["--out", target, "--format", fmt, "--apply"])))
+        with io.open(or_csv, "r", encoding="utf-8", newline="") as handle:
+            or_rows = list(csv.reader(handle))[1:]
+        with io.open(or_json, "r", encoding="utf-8") as handle:
+            or_doc = json.load(handle)
+        check(dict((row[0], row[7]) for row in or_rows).get("orphan") == ""
+              and [f["anonymous"] for f in or_doc["findings"]
+                   if f["kind"] == "orphan"] == [None],
+              "a probed run still records an orphan as unknown, because an "
+              "orphan's url was never asked  <-- pinned defect")
 
         code, seen = captured(lambda: serving(site(), lambda: main(
             ARGV + ["--out", workdir, "--format", "csv", "--apply"])))

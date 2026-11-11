@@ -96,6 +96,8 @@ PASS  a ghost whose probe could not ask is recorded as unknown, not as not anony
 ...
 PASS  a user:password@ in a url does not survive sanitising  <-- pinned defect
 ...
+PASS  a password holding 'Hunter/2pw' is removed whole  <-- pinned defect
+...
 PASS  the guarded lead characters are exactly = + - @ tab and carriage return, written out here so the constant cannot shrink unseen  <-- pinned defect
 PASS  a cell led by =, +, -, @, tab or carriage return gets one apostrophe  <-- pinned defect
 ...
@@ -107,6 +109,8 @@ PASS  the folder column is guarded for =, +, -, @, tab and carriage return  <-- 
 ...
 PASS  the item_access column is guarded for =, +, -, @, tab and carriage return  <-- pinned defect
 PASS  severity stays a plain number and kind and anonymous are untouched
+...
+PASS  a password the server echoes back form-encoded or percent-encoded is redacted too  <-- pinned defect
 ...
 PASS  exactly 10,000 is the CAP and never a total  <-- pinned defect
 ...
@@ -121,14 +125,19 @@ PASS  a service that answers a probe with a login page is NOT reported anonymous
 ...
 PASS  the token in the url urllib quoted back is redacted out of the error  <-- pinned defect
 ...
+PASS  the referer posted to the portal carries no password and no token from the --portal url  <-- pinned defect
+...
 PASS  the portal's error code is reported and the dead token is not  <-- pinned defect
 ...
 PASS  the anonymously reachable service with no item is reported  <-- pinned defect
 ...
 PASS  the web map is reported as unreconciled rather than as an orphan  <-- pinned defect
 ...
+PASS  one service down for the probe and no finding exits 2, not 0  <-- pinned defect
+...
 PASS  --no-probe with nothing to report does not claim that none answered anonymously  <-- pinned defect
 ...
+PASS  a probed run still records an orphan as unknown, because an orphan's url was never asked  <-- pinned defect
 PASS  a report that cannot be written exits 2 with a message, not 1 with a traceback  <-- pinned defect
 PASS  a password in --server and a token in --portal are not echoed  <-- pinned defect
 ...
@@ -151,9 +160,8 @@ PASS  a unique prefix of the write flag is refused, because argparse would other
 PASS  a plausible-looking --unpublish is refused, because this tool changes nothing  <-- pinned defect
 ...
 PASS  the harness records a false check, a missing exception, two wrong exceptions, an argv argparse accepted, two bad enumerations, four bad url comparisons and three bad calls as thirteen failures, so a broken tool turns this self-test red  <-- pinned defect
-...
 --------------------------------------------------------------------
-516 assertions, 0 failed
+528 assertions, 0 failed
 ```
 
 ## Requirements
@@ -250,9 +258,10 @@ request did not fail" proves nothing.
 
 A probe can also fail to ask. A service that is down, an HTTP 500 and an error nobody recognises
 leave the question open. Those services are recorded as unknown: the `anonymous` column is empty
-and the JSON value is `null`. If no probe got a definite answer, the run says so and exits 2, and
-it never prints that nothing answered anonymously. `--no-probe` leaves every service unknown for
-the same reason.
+and the JSON value is `null`. A run with no finding exits 2 when even one service could not be
+probed, because that service might be open to everyone, and it never prints that nothing answered
+anonymously. An orphan is never probed, because its url names no service on this server, so its
+`anonymous` value is always unknown. `--no-probe` leaves every ghost unknown for the same reason.
 
 ## Why not the tools that already exist
 
@@ -344,12 +353,15 @@ those six characters. `severity` stays a plain number, and `kind` and `anonymous
 this tool, so they are not touched. Only the CSV is guarded. The JSON report carries the raw text.
 
 ```
-anonymous-ghost,100,...,'=cmd,MapServer,yes,answered with currentVersion and no token,,,,,
-orphan,20,...,abc,'@evil,'+owner,Feature Service,public
+kind,severity,key,service_url,folder,name,type,anonymous,detail,item_id,item_title,item_owner,item_type,item_access
+anonymous-ghost,100,127.0.0.1:8811/=cmd/MapServer,http://127.0.0.1:8811/arcgis/rest/services/=cmd/MapServer,,'=cmd,MapServer,yes,answered with currentVersion and no token,,,,,
+orphan,20,127.0.0.1:8811/gone/FeatureServer,http://127.0.0.1:8811/arcgis/rest/services/Gone/FeatureServer,,,,,,abc,'@evil,'+owner,Feature Service,public
 ```
 
-That is the output of a one-off run against a local `http.server` stand-in, with a service named
-`=cmd` and an item titled `@evil` owned by `+owner`. The self-test has one assertion for each of
+That is the header and two rows of the output of a real run of `main()` over a socket against a
+local `http.server` stand-in, with a service named `=cmd` and an item titled `@evil` owned by
+`+owner`. The orphan's `anonymous` cell is empty because an orphan is never probed. The stand-in
+script is not part of this repository. The self-test has one assertion for each of
 the eleven text columns, and each one tries all six characters. They are written out as a literal
 tuple in the test, so shrinking the constant in the tool turns the self-test red. The tool never reads its own CSV
 back, so there is nothing to un-prefix. If you load the file into a script, strip one leading
@@ -359,9 +371,9 @@ apostrophe from a cell that starts with `'` followed by one of the six character
 
 | Code | Meaning |
 |---|---|
-| 0 | Every service has a portal item and none answered without a token. |
-| 1 | There are findings to review. |
-| 2 | The server or the portal could not be read, so no list is given. Also: the report file could not be written, or no service gave a definite probe answer. |
+| 0 | Every service has a portal item and none answered without a token. Also: `--no-probe` was given and there is no ghost or orphan. |
+| 1 | There are findings to review. A finding wins over an unanswered probe. |
+| 2 | The server or the portal could not be read, so no list is given. Also: the report file could not be written, or there is no finding and at least one service could not be probed. |
 | 64 | Usage error, including an unknown flag or a bad value. |
 
 ## Limits
@@ -377,16 +389,17 @@ apostrophe from a cell that starts with `'` followed by one of the six character
   `:8443` services as ghosts. The port is in the key the finding prints, so it is visible.
 - `--no-probe` leaves the anonymity column empty. Without the probe the tool reports what the
   portal and the server disagree about, and nothing about who can read it. With no finding it
-  exits 0 and says the probe was not run.
+  exits 0 and says the probe was not run. You asked it not to look, so that exit 0 means nothing
+  was disproved, not that the org is clean.
 - The probe is one GET per service, done in sequence. A catalog with thousands of services takes
   as long as that sounds. `--timeout` is per service.
 - A service that is down during the probe is recorded as unknown, not as not anonymous. It may
   well be anonymous when it comes back. The summary counts them. If some answered and some did
-  not, the run still exits 0 when there is no finding, so read that count.
+  not, the run exits 2 when there is no finding and 1 when there is one, so read that count.
 - Anonymous means the service description answered. It does not mean the data answered. A service
   can return its metadata to anybody and refuse a query, which is unusual but real.
-- ArcGIS Server folders are one level deep. The walk recurses anyway, and stops on a folder it has
-  already visited, because a reverse proxy can produce a listing that points back at itself.
+- The walk recurses to any depth, whatever the server allows, and stops on a folder it has already
+  visited, because a reverse proxy can produce a listing that points back at itself.
 - Esri's documentation does not say whether `/rest/services` lists a stopped service. `--admin`
   reads the admin catalog instead, which needs a server administrator token. A stopped service
   cannot service requests, so it will not answer the probe.
@@ -410,26 +423,48 @@ apostrophe from a cell that starts with `'` followed by one of the six character
 - Item titles and service names are printed to the terminal as they are, so a control or escape
   character in published text reaches the console.
 - A token or password inside the url you pass as `--server` or `--portal`, or inside an item's url,
-  is dropped before anything is requested, printed or written. It never authenticates, so use a
-  token.
+  is dropped before anything is requested, printed or written, including the `referer` posted to
+  `generateToken`. The credential is cut at the last `@`, so a password that holds `/`, `?` or `#`
+  goes too. It never authenticates, so use a token. The price is that an `@` in the query string of
+  a url that also has a `:` before it is read as a credential separator, and the url is cut short.
+- A password that the server echoes back in an error is removed in its plain, form-encoded and
+  percent-encoded spellings. Any other encoding is not recognised.
 - A server that answers with an HTTP redirect to another host gets the token, because `urllib`
-  follows it with the query string intact. Point `--server` and `--portal` only at hosts you trust.
+  follows it with the query string intact. The probe follows redirects too, without a token. A
+  server that redirects a probe or a catalog call sends the request to whatever host its `Location`
+  header names, so point `--server` and `--portal` only at hosts you trust.
+- Folder and service names come from the catalog and are put into the request path. A catalog entry
+  whose name holds `?`, `#` or `../` changes the path requested on the server host, never the host,
+  and the probe strips everything after a `?`.
 - The window ends at the client's clock. An item the portal created a moment after that reading is
   missed, and its service reads as a ghost. That is the safe direction, and a re-run clears it.
 - A run that only has enumeration warnings exits 0 when it has no finding. Missing items can only
-  add false ghosts, but an orphan could go unseen, so read the warnings.
+  add false ghosts, but an orphan could go unseen, so read the warnings. Exit 0 after enumeration
+  warnings means nothing was disproved, not that the org is clean.
 - A catalog read with a token that cannot see every service reports only the services that token
   may list. An empty catalog next to an empty portal is a clean result.
 - Probe urls are not percent-encoded. A service or folder name with non-ASCII characters cannot be
-  probed and is recorded as unknown. Esri service names are normally ASCII.
+  probed and is recorded as unknown. Esri service names are normally ASCII. A non-ASCII or spaced
+  folder name stops the catalog walk with exit 2 instead of skipping that folder.
 - `--self-test` makes a temporary directory and a temporary CSV outside `--apply`, and removes them
   afterwards. Nothing else the tool does writes without `--apply`.
-- The end-to-end runs in the self-test do not cover `generateToken` over a socket, `--admin`,
-  `--insecure`, the date bisect or the 10,000 refusal. Those run only against the in-process
-  stand-in.
-- Coverage is 100 percent of branches on Windows, 1717 statements and 344 branches. Linux was run
+- The shipped self-test drives the network code through an in-process stand-in, not a socket. The
+  real HTTP path was checked by hand against a local `http.server`: a full run with `--token`
+  and a `--username` sign-in whose posted `referer` carried no credential. That stand-in is not in
+  this repository. The end-to-end runs in the self-test do not cover `generateToken` over a socket,
+  `--admin`, `--insecure`, the date bisect or the 10,000 refusal.
+- These three Esri behaviours rest on observation and are not cited to an Esri page: the HTTP 200
+  with error 499 `Token Required`, the default ports 80, 443, 6080 and 6443, and whether
+  `/rest/services` lists a stopped service.
+- A cell with leading whitespace before a formula character is not guarded. The strip rule cannot
+  distinguish a guarded cell from source text that began with an apostrophe.
+- Import the CSV as UTF-8 in Excel. The file has no byte order mark, so a double-click may show
+  non-ASCII titles as mojibake.
+- A response in a shape the tool does not expect can end the run with a Python traceback and exit
+  code 1, which is the findings code.
+- Coverage is 100 percent of branches on Windows, 1741 statements and 352 branches. Linux was run
   without the coverage module, so the Linux run proves the assertions and not the percentage. The
-  Windows 3.13, Windows 3.9 and Linux 3.12 runs print the same assertion count, 516, because the
+  Windows 3.13, Windows 3.9 and Linux 3.12 runs print the same assertion count, 528, because the
   self-test does not branch on the host.
 
 ## Sources
