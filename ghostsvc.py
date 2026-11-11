@@ -867,23 +867,45 @@ def finding_record(finding):
     }
 
 
+FORMULA_LEADS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def cell(value):
+    """A text cell a spreadsheet will not run as a formula.
+
+    A cell that starts with = + - @ tab or carriage return gets one leading
+    apostrophe. Service names, folders and item titles are typed by whoever
+    published them, so a title of =HYPERLINK(...) would otherwise run on the
+    machine of the person who opens the report. Only text goes through here:
+    severity stays a number.
+    """
+    text = "%s" % (value,)
+    if text[:1] in FORMULA_LEADS:
+        return "'" + text
+    return text
+
+
 def csv_rows(document):
     """The report flattened to one row per finding per item.
 
     A finding with three items becomes three rows. A spreadsheet is filtered
     and sorted by column, and one row holding three item ids cannot be.
+    Every text cell passes through cell(). kind, severity and the yes/no
+    column are written by this tool, never by the data, so they do not.
     """
     rows = []
     for rec in document["findings"]:
-        base = [rec["kind"], rec["severity"], rec["key"], rec["service_url"],
-                rec["folder"], rec["name"], rec["type"],
-                "yes" if rec["anonymous"] else "no", rec["detail"]]
+        base = [rec["kind"], rec["severity"], cell(rec["key"]),
+                cell(rec["service_url"]), cell(rec["folder"]),
+                cell(rec["name"]), cell(rec["type"]),
+                "yes" if rec["anonymous"] else "no", cell(rec["detail"])]
         if not rec["items"]:
             rows.append(base + ["", "", "", "", ""])
             continue
         for item in rec["items"]:
-            rows.append(base + [item["id"], item["title"], item["owner"],
-                                item["type"], item["access"]])
+            rows.append(base + [cell(item["id"]), cell(item["title"]),
+                                cell(item["owner"]), cell(item["type"]),
+                                cell(item["access"])])
     return rows
 
 
@@ -1179,6 +1201,15 @@ def write_csv(document, path):
         for row in csv_rows(document):
             writer.writerow(row)
     return path
+
+
+def verdict(total, failed):
+    """The self-test footer as (lines, exit code). Pure, so it can be tested."""
+    if failed:
+        lines = ["%d assertions, %d failed" % (total, len(failed))]
+        lines.extend("  FAILED: %s" % label for label in failed)
+        return lines, 1
+    return ["%d assertions, 0 failed" % total], 0
 
 
 def _make_parent(path):
@@ -1987,6 +2018,52 @@ def self_test():
           "and both rows carry the same service key")
     check(all(len(row) == len(CSV_FIELDS) for row in rows + multi),
           "every csv row has every column")
+
+    # ---- formula injection: a text cell must not be run by a spreadsheet
+    check(all(cell(lead + "x") == "'" + lead + "x" for lead in FORMULA_LEADS),
+          "a cell led by =, +, -, @, tab or carriage return gets one "
+          "apostrophe  <-- pinned defect")
+    check(cell("Hydrants") == "Hydrants" and cell("") == "",
+          "ordinary text and an empty cell are untouched")
+    check(cell("a=b") == "a=b" and cell("Roads-2") == "Roads-2",
+          "a lead character that is not first is untouched")
+    check(cell(None) == "None" and cell(-5) == "'-5",
+          "a value that is not text is turned into text before it is judged")
+    check(cell("=1+1") == "'=1+1" and cell(cell("=1+1")) == "'=1+1",
+          "a cell already led by the apostrophe is not prefixed twice")
+    injected = []
+    for lead in FORMULA_LEADS:
+        text = lead + "x"
+        injected.append({
+            "kind": "anonymous-ghost", "severity": 100, "key": text,
+            "service_url": text, "folder": text, "name": text, "type": text,
+            "anonymous": True, "detail": text,
+            "items": [{"id": text, "title": text, "owner": text,
+                       "type": text, "access": text}]})
+    leaked = {"findings": injected}
+    probe_dir = tempfile.mkdtemp(prefix="ghostsvc-formula-")
+    try:
+        probe_csv = write_csv(leaked, os.path.join(probe_dir, "f.csv"))
+        with io.open(probe_csv, "r", encoding="utf-8", newline="") as handle:
+            probe_table = list(csv.reader(handle))
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+    check(len(probe_table) == 1 + len(FORMULA_LEADS),
+          "six hostile findings read back as six rows under the header, so a "
+          "tab or carriage return inside a cell did not split a row")
+    for column in ("key", "service_url", "folder", "name", "type", "detail",
+                   "item_id", "item_title", "item_owner", "item_type",
+                   "item_access"):
+        position = CSV_FIELDS.index(column)
+        check(all(row[position] == "'" + lead + "x"
+                  for row, lead in zip(probe_table[1:], FORMULA_LEADS)),
+              "the %s column is guarded for =, +, -, @, tab and carriage "
+              "return  <-- pinned defect" % column)
+    check(all(row[CSV_FIELDS.index("severity")] == "100"
+              and row[CSV_FIELDS.index("anonymous")] == "yes"
+              and row[CSV_FIELDS.index("kind")] == "anonymous-ghost"
+              for row in probe_table[1:]),
+          "severity stays a plain number and kind and anonymous are untouched")
 
     # ---- rendering
     lines = describe(ranked)
@@ -3077,15 +3154,25 @@ def self_test():
           "a call that did not fail the right way yields no message to assert "
           "on")
 
+    red_lines, red_code = verdict(7, ["one", "two"])
+    check(red_code == 1 and red_lines == ["7 assertions, 2 failed",
+                                          "  FAILED: one", "  FAILED: two"],
+          "a failed run prints its count and every failed label, and exits 1")
+    green_lines, green_code = verdict(7, [])
+    check(green_code == 0 and green_lines == ["7 assertions, 0 failed"],
+          "a clean run prints the footer the README quotes, and exits 0")
+    import runpy
+    namespace = runpy.run_path(os.path.abspath(__file__),
+                               run_name="ghostsvc_imported")
+    check(callable(namespace["main"]),
+          "importing the file runs nothing, because main() sits behind the "
+          "__main__ guard")
+
     print("-" * 68)
-    total = passed[0] + len(failed)
-    if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for item_label in failed:
-            print("  FAILED: %s" % item_label)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+    lines, code = verdict(passed[0] + len(failed), failed)
+    for line in lines:
+        print(line)
+    return code
 
 
 # ----------------------------------------------------------------------- cli

@@ -58,6 +58,14 @@ PASS  an empty portal makes every service a ghost, which is why an enumeration t
 PASS  an item with no url and an item pointing at a web page are NOT orphans, because neither claims a service  <-- pinned defect
 PASS  an item on the second federated server does not silence the ghost on the first  <-- pinned defect
 ...
+PASS  a cell led by =, +, -, @, tab or carriage return gets one apostrophe  <-- pinned defect
+PASS  a cell already led by the apostrophe is not prefixed twice
+PASS  the key column is guarded for =, +, -, @, tab and carriage return  <-- pinned defect
+PASS  the service_url column is guarded for =, +, -, @, tab and carriage return  <-- pinned defect
+PASS  the folder column is guarded for =, +, -, @, tab and carriage return  <-- pinned defect
+PASS  the item_access column is guarded for =, +, -, @, tab and carriage return  <-- pinned defect
+PASS  severity stays a plain number and kind and anonymous are untouched
+...
 PASS  exactly 10,000 is the CAP and never a total  <-- pinned defect
 PASS  a short page advances by the ten rows it got, not by the hundred it asked for  <-- pinned defect
 PASS  a one day partition with nothing left to split on REFUSES  <-- pinned defect
@@ -80,13 +88,13 @@ PASS  a unique prefix of the write flag is refused, because argparse would other
 PASS  a plausible-looking --unpublish is refused, because this tool changes nothing  <-- pinned defect
 PASS  the harness records a false check, a missing exception, two wrong exceptions, an argv argparse accepted, two bad enumerations, four bad url comparisons and three bad calls as thirteen failures, so a broken tool turns this self-test red  <-- pinned defect
 --------------------------------------------------------------------
-446 assertions, 0 failed
+467 assertions, 0 failed
 ```
 
 ## Requirements
 
 Python 3.9 or newer. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
-`time`, `argparse`, `datetime`, `getpass`, and `re`, `tempfile` and `shutil` in the self-test. It
+`time`, `argparse`, `datetime`, `getpass`, and `re`, `tempfile`, `shutil` and `runpy` in the self-test. It
 runs on ArcGIS Pro's Python and on a plain `python3`. `arcpy` is not used and the `arcgis` package
 is not needed.
 
@@ -244,6 +252,27 @@ are fine.
 
 It refuses the same way when the catalog walk cannot finish, and when `--portal` is missing.
 
+## The CSV file
+
+`--format csv` writes one row per finding per item. A spreadsheet runs a cell that starts with
+`=`, `+`, `-` or `@`, and Excel also treats a leading tab or carriage return that way. Every text
+in this report was typed by someone else: a service name, a folder, an item title, an item owner.
+A service named `=cmd` or an item titled `@evil` would otherwise run on the machine of whoever
+opens the report. Every text column therefore gets one leading apostrophe when it starts with one of
+those six characters. `severity` stays a plain number, and `kind` and `anonymous` are written by
+this tool, so they are not touched.
+
+```
+anonymous-ghost,100,...,'=cmd,MapServer,yes,answered with currentVersion and no token,,,,,
+orphan,20,...,abc,'@evil,'+owner,Feature Service,public
+```
+
+That is the output of a real run against a local `http.server` stand-in, with a service named
+`=cmd` and an item titled `@evil` owned by `+owner`. The self-test has one assertion for each of
+the eleven text columns, and each one tries all six characters. The tool never reads its own CSV
+back, so there is nothing to un-prefix. If you load the file into a script, strip one leading
+apostrophe from a cell that starts with `'` followed by one of the six characters.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -285,6 +314,23 @@ It refuses the same way when the catalog walk cannot finish, and when `--portal`
 - The item side is every item the query matches, not only service items. A list of service item
   types kept in this file would go stale, and a missing type reads as a ghost. On a large
   organization `--query` makes the run faster, at the cost of the items the query leaves out.
+
+- The guard covers the six characters named above. OWASP also lists a leading line feed and the
+  full-width forms of `=`, `+`, `-` and `@`, and none of those is guarded. OWASP also warns that a
+  quote prefix is unreliable in Excel once the file is saved and opened again. Open the report, do not
+  round-trip it.
+- Coverage is 100 percent of branches on Windows, 1554 statements and 308 branches. Linux was run
+  without the coverage module, so the Linux run proves the assertions and not the percentage. The
+  two runs print the same assertion count, 467, because the self-test does not branch on the host.
+
+## Sources
+
+- Python `csv` module, `newline=''` on the file object:
+  https://docs.python.org/3/library/csv.html
+- Formula characters and the apostrophe mitigation, including the line feed and full-width cases
+  this tool does not guard: https://owasp.org/www-community/attacks/CSV_Injection
+- `search` returns `num` up to 100 and makes only the top 10,000 results reachable by paging:
+  https://developers.arcgis.com/rest/users-groups-and-items/search/
 
 ## Contributing
 
