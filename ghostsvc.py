@@ -50,6 +50,7 @@ import getpass
 import io
 import json
 import os
+import re
 import ssl
 import sys
 import time
@@ -72,13 +73,18 @@ DEFAULT_PORTS = (80, 443, 6080, 6443)
 # The service types a url may end in, in the spelling ArcGIS uses. The last
 # path segment has to be one of these or the url is refused rather than keyed,
 # because a url this tool cannot read becomes a false ghost or a false orphan.
+# The list is this tool's own, not copied from an Esri page. A type missing from
+# it makes an item of that type unreadable and a catalog entry of that type
+# abort the run, so add the spelling the server prints.
 SERVICE_TYPES = (
     "MapServer", "FeatureServer", "ImageServer", "GPServer", "GeocodeServer",
     "GeometryServer", "GeoDataServer", "GlobeServer", "SceneServer",
     "StreamServer", "VectorTileServer", "NAServer", "MobileServer",
     "KnowledgeGraphServer", "VideoServer", "RelationalCatalogServer",
     "ParcelFabricServer", "UtilityNetworkServer", "VersionManagementServer",
-    "ValidationServer", "TraceNetworkServer",
+    "ValidationServer", "TraceNetworkServer", "KMLServer", "WFSServer",
+    "WMSServer", "WCSServer", "WMTSServer", "OGCFeatureServer", "SearchServer",
+    "SchematicsServer", "WorkflowManagerServer",
 )
 
 # The server caps num on /sharing/rest/search whatever is asked for, and counts
@@ -154,6 +160,8 @@ CSV_FIELDS = ("kind", "severity", "key", "service_url", "folder", "name",
               "item_owner", "item_type", "item_access")
 
 _TYPE_BY_LOWER = dict((t.lower(), t) for t in SERVICE_TYPES)
+
+_HOST_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
 
 
 class EnumerationIncomplete(RuntimeError):
@@ -321,7 +329,9 @@ def service_key(url):
     if not stype:
         raise ValueError("%r does not end in an ArcGIS service type, it ends "
                          "in %r" % (raw, tail[-1]))
-    body = "/".join(seg.lower() for seg in tail[:-1])
+    # Unquoted, because service_url percent-encodes the names it takes from the
+    # catalog and an item url may carry the same name spelled either way.
+    body = "/".join(urllib.parse.unquote(seg).lower() for seg in tail[:-1])
     return "%s/%s/%s" % (key_host, body, stype)
 
 
@@ -347,6 +357,48 @@ def host_domain(url):
     host = (parts.hostname or "").lower().rstrip(".")
     short = _short_host(host)
     return host[len(short) + 1:] if short != host else ""
+
+
+def parse_host_aliases(values):
+    """--host-alias ITEMHOST=SERVERHOST pairs as a dict, or raises ValueError.
+
+    A portal item registered under a public name, maps.example.org, for a server
+    the catalog calls gis-02.example.org, keys to a different host and reads as
+    an orphan beside a ghost. The operator knows both names, and the tool
+    cannot. Both sides are bare host names: a port is kept from the item url, and
+    a url, a path or a credential is refused, so nothing typed here is ever
+    requested.
+    """
+    aliases = {}
+    for value in values or ():
+        item_host, _eq, server_host = ("%s" % (value,)).partition("=")
+        item_host, server_host = item_host.strip().lower(), server_host.strip()
+        if not (_HOST_NAME.match(item_host) and _HOST_NAME.match(server_host)):
+            raise ValueError("--host-alias must look like ITEMHOST=SERVERHOST, "
+                             "two bare host names, got %r" % sanitize_url(value))
+        aliases[item_host] = server_host.lower()
+    return aliases
+
+
+def alias_url(url, aliases):
+    """The url with its host replaced when --host-alias names that host.
+
+    Used for matching only. The item keeps the url it has in the report. A url
+    the key could not read anyway is returned as it was.
+    """
+    raw = ("%s" % (url or "")).strip()
+    if not aliases or not raw:
+        return url
+    try:
+        parts = urllib.parse.urlsplit(raw if "://" in raw else "//" + raw)
+        port = parts.port
+    except ValueError:
+        return url
+    target = aliases.get((parts.hostname or "").lower().rstrip("."))
+    if not target:
+        return url
+    return "%s://%s%s%s" % (parts.scheme or "https", target,
+                            "" if port is None else ":%d" % port, parts.path)
 
 
 def same_machine(left, right):
@@ -388,14 +440,23 @@ def service_url(root, record):
     Always the REST url, even when the catalog was read from admin. The finding
     exists so that somebody can paste the url and see what a stranger sees, and
     nobody without an admin token can open an admin url.
+
+    Folder and service names come from the catalog and are percent-encoded, so
+    a name holding @, ? or # cannot reach the probe as part of the authority
+    or the query and send the request to another host.
     """
     base = sanitize_url(root).rstrip("/")
     parts = [base, "rest", "services"]
     if record.get("folder"):
-        parts.append(record["folder"].strip("/"))
-    parts.append(record["name"])
-    parts.append(record["type"])
+        parts.append(_quoted_path(record["folder"].strip("/")))
+    parts.append(_quoted_path(record["name"]))
+    parts.append(_quoted_path(record["type"]))
     return "/".join(parts)
+
+
+def _quoted_path(path):
+    """Each segment of a catalog-supplied path, percent-encoded."""
+    return "/".join(urllib.parse.quote(seg, safe="") for seg in path.split("/"))
 
 
 def server_root(url):
@@ -446,6 +507,12 @@ def walk_catalog(fetch, root="", max_folders=MAX_FOLDERS):
             raise ValueError("the catalog for folder %r answered with a %s, "
                              "not a service listing"
                              % (folder, type(body).__name__))
+        if "services" not in body and "folders" not in body:
+            # An admin call that failed says so inside a 200 and has neither,
+            # and read as an empty catalog it turns every item into an orphan.
+            raise ValueError("the catalog for folder %r has no services and no "
+                             "folders member, so it is not a service listing"
+                             % (folder,))
         for sub in body.get("folders") or []:
             sub = ("%s" % (sub,)).strip().strip("/")
             if sub:
@@ -716,9 +783,16 @@ def crawl_partition(fetch, query, num=SEARCH_MAX_NUM):
         totals.append(int(page.get("total") or 0))
         results = page.get("results") or []
         for raw in results:
+            if not isinstance(raw, dict):
+                raise ValueError("a search result is a %s, not an object"
+                                 % type(raw).__name__)
             iid = raw.get("id")
             if not iid:
-                raise ValueError("a search result has no id: %r" % (raw,))
+                # The title and the sanitised url, never the raw result: its
+                # url may carry the token its publisher registered it with.
+                raise ValueError("a search result has no id (title %r, url %r)"
+                                 % (raw.get("title"),
+                                    sanitize_url(raw.get("url"))))
             # Union by id. Two partitions that overlap, because an item was
             # edited between them, contribute that item once.
             items[iid] = raw
@@ -885,12 +959,14 @@ class Report(object):
             len(self.findings), len(self.services), len(self.items))
 
 
-def reconcile(services, items, anonymous=(), details=None, probes=None):
+def reconcile(services, items, anonymous=(), details=None, probes=None,
+              aliases=None):
     """Join a server catalog to a portal item list and report the difference.
 
     A service and an item meet when their urls normalise to the same key, which
     is the only reason service_key is worth as much code as it is. Everything
-    here is a set operation over those keys.
+    here is a set operation over those keys. aliases is the --host-alias map,
+    applied to the item side only.
     """
     anon = set(anonymous)
     details = details or {}
@@ -898,7 +974,7 @@ def reconcile(services, items, anonymous=(), details=None, probes=None):
     unreadable = []
     claimed = set()
     for raw in items:
-        key = keyed(raw.get("url"))
+        key = keyed(alias_url(raw.get("url"), aliases))
         if key is None:
             # An item with no url, or with a url that does not name a service,
             # cannot be an orphan: there is no service it claims to have. A web
@@ -916,7 +992,8 @@ def reconcile(services, items, anonymous=(), details=None, probes=None):
         # domain with the same first label is another server's service, not
         # this one's.
         mine = [raw for raw in by_key.get(key) or []
-                if same_machine(raw.get("url"), svc.get("url"))]
+                if same_machine(alias_url(raw.get("url"), aliases),
+                                svc.get("url"))]
         claimed.update(id(raw) for raw in mine)
         open_to_all = key in anon
         if open_to_all and not mine:
@@ -1046,7 +1123,10 @@ def describe(report):
                    "they answer." % (len(report.untested), len(report.services)))
     out.append("")
     if not report.findings:
-        if report.probe_skipped:
+        if report.warnings:
+            out.append("No finding, but the enumeration warned above, so this "
+                       "is not a clean result. Run again.")
+        elif report.probe_skipped:
             out.append("Every service on the server has a portal item.")
         elif report.probe_failed:
             out.append("Every service on the server has a portal item, but no "
@@ -1085,10 +1165,15 @@ def exit_code(report):
     still win: a ghost is worth reading whether or not the probe worked.
     A run that skipped the probe on request (--no-probe) answered the only
     question it was asked, so it is not unsure.
+
+    An enumeration warning is the same kind of doubt. A portal that moved while
+    it was read may hold an item this run never saw, so a run with no finding
+    and a warning is not clean.
     """
     if report.findings:
         return 1
-    return 2 if report.untested and not report.probe_skipped else 0
+    unsure = report.warnings or (report.untested and not report.probe_skipped)
+    return 2 if unsure else 0
 
 
 # ------------------------------------------------------------------- plumbing
@@ -1203,12 +1288,30 @@ def _get(endpoint, params, insecure=False, post=False, secret=None,
         raise RuntimeError("%s: answered with a JSON %s, not an object, so "
                            "this is not an ArcGIS response"
                            % (endpoint, type(body).__name__))
-    if "error" in body:
-        err = body["error"]
-        raise RuntimeError(redact("%s: %s %s" % (endpoint, err.get("code"),
-                                                 err.get("message")), secret,
+    problem = _error_text(body)
+    if problem:
+        raise RuntimeError(redact("%s: %s" % (endpoint, problem), secret,
                                   params.get("token"), params.get("password")))
     return body
+
+
+def _error_text(body):
+    """What a 200 answer says went wrong, or "" when it says nothing did.
+
+    The portal and the services directory use {"error": {"code", "message"}}.
+    The Administrator API uses {"status": "error", "messages": [...], "code"}.
+    A proxy may put a bare string under "error". All three are failures.
+    """
+    err = body.get("error")
+    if isinstance(err, dict):
+        return "%s %s" % (err.get("code"), err.get("message"))
+    if err:
+        return "%s" % (err,)
+    if body.get("status") == "error":
+        return "%s %s" % (body.get("code"),
+                          "; ".join("%s" % (m,)
+                                    for m in body.get("messages") or []))
+    return ""
 
 
 def portal_call(url, path, params, insecure=False, post=False, secret=None):
@@ -1223,7 +1326,7 @@ def catalog_fetch(root, token, admin=False, insecure=False):
     base = "%s/%s/services" % (server_root(root), "admin" if admin else "rest")
 
     def fetch(folder):
-        endpoint = "%s/%s" % (base, folder) if folder else base
+        endpoint = "%s/%s" % (base, _quoted_path(folder)) if folder else base
         params = {"token": token} if token else {}
         return _get(endpoint, params, insecure=insecure, secret=token)
     return fetch
@@ -1376,7 +1479,6 @@ def _make_parent(path):
 
 def self_test():
     """Assertions over the reconcile core. No server, no network, no tokens."""
-    import re
     import shutil
     import tempfile
 
@@ -1746,9 +1848,9 @@ def self_test():
     check(walk_catalog(catalog({"": {"folders": [], "services": []}}),
                        SERVER) == [],
           "a server with no services at all gives an empty list")
-    check(walk_catalog(catalog({"": {}}), SERVER) == [],
-          "a catalog response with neither key gives an empty list, not a "
-          "TypeError")
+    raises(lambda: walk_catalog(catalog({"": {}}), SERVER),
+           "a catalog response with neither key is not a listing, so it "
+           "raises instead of reading as an empty server  <-- pinned defect")
     check(walk_catalog(catalog({"": {"folders": None, "services": None}}),
                        SERVER) == [],
           "and null folders and services are read as empty")
@@ -3682,6 +3784,12 @@ def _parse(argv):
                     default=MAX_FOLDERS,
                     help="give up on the catalog walk after this many folders "
                          "(default %d)" % MAX_FOLDERS)
+    ap.add_argument("--host-alias", dest="host_alias", action="append",
+                    default=[], metavar="ITEMHOST=SERVERHOST",
+                    help="treat portal items on ITEMHOST as items on "
+                         "SERVERHOST, the host in --server. For items "
+                         "registered under a public name. Repeatable. Bare "
+                         "host names only.")
     ap.add_argument("--insecure", action="store_true",
                     help="skip TLS certificate verification, for a deployment "
                          "behind an internal CA. Refused together with "
@@ -3724,8 +3832,8 @@ def main(argv=None):
         if not is_http_url(value):
             print("error: %s must start with https:// or http://, got %r. "
                   "urllib quotes a url it cannot open back into its own "
-                  "error, and that url carries the token." % (label, value),
-                  file=sys.stderr)
+                  "error, and that url carries the token."
+                  % (label, sanitize_url(value)), file=sys.stderr)
             return 64
     if args.apply and not args.out:
         print("error: --apply needs --out, the file to write the report to.",
@@ -3735,6 +3843,11 @@ def main(argv=None):
         print("error: --insecure with --username would post your password "
               "down an unverified connection. Pass --token instead.",
               file=sys.stderr)
+        return 64
+    try:
+        aliases = parse_host_aliases(args.host_alias)
+    except ValueError as exc:
+        print("error: %s" % exc, file=sys.stderr)
         return 64
     if args.num < 1:
         print("error: --num must be at least 1.", file=sys.stderr)
@@ -3795,7 +3908,7 @@ def main(argv=None):
         return 2
 
     report = reconcile(services, list(items.values()), anonymous, details,
-                       probes)
+                       probes, aliases)
     report.warnings.extend(warnings)
 
     print("")
