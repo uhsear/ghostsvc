@@ -193,20 +193,25 @@ def sanitize_url(url):
         # No scheme: a "://" inside a query string is not one.
         scheme, sep, rest = "", "", raw
     # A password may hold a / ? or # that RFC 3986 would read as the end of the
-    # authority. The credential is cut at the last @ before anything else is
-    # split, so none of it is left behind. An @ that follows a ? or # and has
-    # a key=value or & between them is a query parameter such as e=a@b.com, not
-    # a credential: cutting there would print the rest of the query, token
-    # included. shortcut: a password that holds ?x=y before its @ is read as a
-    # query and keeps its first part, which no real password does.
-    at = rest.rfind("@")
+    # authority, so the credential is cut at an @ found by searching the whole
+    # rest, last first. An @ is refused as the credential end when it sits in a
+    # query or fragment: either a key=value or & lies between the ? or # and the
+    # @ (e=a@b.com), or a / precedes the ? or # (the authority has ended), or
+    # the text after it up to the next / ? or # is no host (x.com&token=T).
+    # Cutting at such an @ would print the rest of the query, token included.
+    # shortcut: a password that holds ?x=y before its @ is read as a query and
+    # keeps its first part, which no real password does.
     marks = [i for i in (rest.find("?"), rest.find("#")) if i >= 0]
-    # A / before the first ? or # means the authority has ended, so the @ after
-    # it sits in the query even when no = or & precedes it (?u@x.com&token=T).
-    in_query = bool(marks) and min(marks) < at and (
-        "/" in rest[:min(marks)] or any(
-            c in rest[min(marks):at] for c in "=&"))
-    if at >= 0 and ":" in rest[:at] and not in_query:
+    at = rest.rfind("@")
+    while at >= 0:
+        in_query = bool(marks) and min(marks) < at and (
+            "/" in rest[:min(marks)] or any(
+                c in rest[min(marks):at] for c in "=&"))
+        tail = re.split("[/?#]", rest[at + 1:], maxsplit=1)[0]
+        if not in_query and not any(c in tail for c in "=&"):
+            break
+        at = rest.rfind("@", 0, at)
+    if at >= 0 and ":" in rest[:at]:
         rest = rest[at + 1:]
     rest = rest.split("#", 1)[0]
     rest = rest.split("?", 1)[0]
@@ -1494,7 +1499,8 @@ def _make_parent(path):
 # ------------------------------------------------------------------ self-test
 
 def self_test():
-    """Assertions over the reconcile core. No server, no network, no tokens."""
+    """Assertions over the reconcile core. No deployment, no real token; the
+    network path runs against one loopback stub."""
     import shutil
     import tempfile
 
@@ -1582,7 +1588,8 @@ def self_test():
         check(lk != rk, label if lk != rk else "%s (both keyed %s)"
               % (label, lk))
 
-    print("ghostsvc self-test: no server, no portal, no network, no token")
+    print("ghostsvc self-test: no deployment, no portal, no token, one "
+          "loopback stub")
     print("-" * 68)
 
     DAY = DAY_MS
@@ -2487,6 +2494,20 @@ def self_test():
                        "MapServer") == "https://2024/MapServer",
           "known limit: an @ in the path of a url that has a port is read as "
           "a credential separator and the host is cut off")
+    for pathless in ("https://h:6443?u@x.com&token=SECRET",
+                     "https://h?u@x.com&token=SECRET",
+                     "https://u:p?w@h/x?u@x.com&token=SECRET",
+                     "https://u:a/pw@h/x?u@x.com&token=SECRET"):
+        check("SECRET" not in sanitize_url(pathless)
+              and "@" not in sanitize_url(pathless)
+              and sanitize_url(pathless).startswith("https://h"),
+              "an @ in a query is not a credential end even when no path "
+              "or no = precedes it, or the password holds ? or /: %s  "
+              "<-- pinned defect" % sanitize_url(pathless))
+    check(sanitize_url("https://u:a/pw@h:6443?u@x.com&token=SECRET")
+          == "https://h:6443",
+          "and a credential with a / before a path-less query @ is still "
+          "cut whole  <-- pinned defect")
     check(item_record({"id": "x", "url": "https://u:ITEMPW@gis.example.org/"
                        "arcgis/rest/services/Old/MapServer"})["url"]
           == "https://gis.example.org/arcgis/rest/services/Old/MapServer",
@@ -3762,6 +3783,141 @@ def self_test():
               "a --timeout of zero is a usage error")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+    # ---- a real socket: the same run against a local http.server stub
+    #
+    # Everything above swaps _opener for an object. This block does not. It
+    # starts a stub on 127.0.0.1 with an ephemeral port, so no fixed port can
+    # already be taken, and runs main() against it with the real urllib
+    # opener, so a url that is built wrongly, a query string that is not
+    # encoded and a POST body that never leaves the process all fail here.
+    import http.server
+    import threading
+
+    class Stub(http.server.BaseHTTPRequestHandler):
+        """A portal and a server in one: it answers only what the run asks."""
+
+        def log_message(self, *args):
+            pass
+
+        def _send(self, body):
+            raw = json.dumps(body).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_POST(self):
+            size = int(self.headers.get("Content-Length") or 0)
+            self.server.posted.append(self.rfile.read(size).decode("utf-8"))
+            self._send({"token": "MINTED"})
+
+        def do_GET(self):
+            self.server.seen.append(self.path)
+            path, _sep, query = self.path.partition("?")
+            params = dict(urllib.parse.parse_qsl(query))
+            if path.endswith("/portals/self"):
+                self._send({"id": "ORG"})
+            elif path.endswith("/search"):
+                self._send(self.server.catalog(
+                    params["q"], int(params["start"]), int(params["num"])))
+            elif path.endswith("/rest/services"):
+                self._send({"folders": [], "services": [
+                    {"name": "=cmd", "type": "MapServer"},
+                    {"name": "\tTab", "type": "MapServer"},
+                    {"name": "Open", "type": "MapServer"}]})
+            elif urllib.parse.unquote(path).endswith("/Open/MapServer"):
+                self._send({"currentVersion": 11.2})
+            else:
+                self._send({"error": {"code": 499,
+                                      "message": "Token Required"}})
+
+    stub = http.server.HTTPServer(("127.0.0.1", 0), Stub)
+    stub.seen, stub.posted = [], []
+    base = "http://127.0.0.1:%d" % stub.server_address[1]
+    stub.catalog = Catalog([
+        {"id": "x1", "title": "@evil", "owner": "+owner",
+         "type": "Map Service", "access": "public", "created": BASE,
+         "url": base + "/arcgis/rest/services/Gone/MapServer"},
+        {"id": "x2", "title": "-hyper", "owner": "ann",
+         "type": "Map Service", "access": "org", "created": BASE + 1,
+         "url": base + "/arcgis/rest/services/Open/MapServer"}])
+    sockdir = tempfile.mkdtemp(prefix="ghostsvc-socket-")
+    worker = threading.Thread(target=stub.serve_forever)
+    worker.daemon = True
+    worker.start()
+    try:
+        sock_argv = ["--server", base + "/arcgis", "--portal", base + "/portal"]
+        sock_csv = os.path.join(sockdir, "live.csv")
+        os.environ.pop(TOKEN_ENV, None)
+        code, seen = captured(lambda: main(
+            sock_argv + ["--token", "SOCKTOK", "--out", sock_csv,
+                         "--format", "csv"]))
+        check(code == 1 and "3 service(s) in the catalog" in seen,
+              "a real run over a socket reads the catalog and finds ghosts")
+        check(not os.path.exists(sock_csv),
+              "and --out without --apply wrote nothing to disk  "
+              "<-- pinned defect")
+        code, seen = captured(lambda: main(
+            sock_argv + ["--token", "SOCKTOK", "--out", sock_csv,
+                         "--format", "csv", "--apply"]))
+        with io.open(sock_csv, "r", encoding="utf-8", newline="") as handle:
+            live = list(csv.reader(handle))
+        by_kind = dict((row[0] + ":" + row[CSV_FIELDS.index("name")], row)
+                       for row in live[1:])
+        check(code == 1 and live[0] == list(CSV_FIELDS) and len(live) == 5,
+              "--apply over a socket writes the header and four findings")
+        check(sorted(by_kind) == ["anonymous:Open", "ghost:'\tTab",
+                                  "ghost:'=cmd", "orphan:"],
+              "a service named =cmd and one led by a tab come back guarded "
+              "from a real server answer  <-- pinned defect")
+        check(by_kind["ghost:'=cmd"][CSV_FIELDS.index("service_url")]
+              == base + "/arcgis/rest/services/%3Dcmd/MapServer",
+              "and the service url carries the name percent-encoded")
+        orphan = by_kind["orphan:"]
+        check(orphan[CSV_FIELDS.index("item_title")] == "'@evil"
+              and orphan[CSV_FIELDS.index("item_owner")] == "'+owner",
+              "an item titled @evil and owned by +owner is guarded in both "
+              "columns  <-- pinned defect")
+        check(by_kind["anonymous:Open"][CSV_FIELDS.index("item_title")]
+              == "'-hyper" and by_kind["anonymous:Open"][
+                  CSV_FIELDS.index("severity")] == "80",
+              "a title led by - is guarded while severity stays a number")
+        probes_seen = [p for p in stub.seen if "/MapServer" in p]
+        check(len(probes_seen) == 6
+              and not any("token=" in p for p in probes_seen),
+              "every probe over the socket went out with no token  "
+              "<-- pinned defect")
+        check(any("token=SOCKTOK" in p for p in stub.seen
+                  if p.split("?")[0].endswith("/search")),
+              "while the portal search carried the token")
+        with io.open(sock_csv, "r", encoding="utf-8") as handle:
+            live_text = handle.read()
+        check("SOCKTOK" not in seen and "SOCKTOK" not in live_text,
+              "and the token reached neither stdout nor the csv")
+
+        os.environ[SECRET_ENV] = "sockpw"
+        try:
+            code, seen = captured(lambda: main(
+                sock_argv + ["--username", "svc"]))
+        finally:
+            del os.environ[SECRET_ENV]
+        check(code == 1 and len(stub.posted) == 1
+              and "password=sockpw" in stub.posted[0]
+              and "username=svc" in stub.posted[0],
+              "--username posts the credentials in the body of a real "
+              "request")
+        check("sockpw" not in seen and "MINTED" not in seen
+              and not any("sockpw" in p for p in stub.seen)
+              and any("token=MINTED" in p for p in stub.seen),
+              "the password is in no url and no output, and the minted "
+              "token is what the later calls carry  <-- pinned defect")
+    finally:
+        stub.shutdown()
+        stub.server_close()
+        worker.join()
+        shutil.rmtree(sockdir, ignore_errors=True)
 
     # ---- argument handling
     args = _parse(["--server", SERVER, "--portal", PORTAL])
