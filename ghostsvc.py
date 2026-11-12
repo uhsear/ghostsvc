@@ -164,8 +164,10 @@ _TYPE_BY_LOWER = dict((t.lower(), t) for t in SERVICE_TYPES)
 _HOST_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
 
 # A host name or address with an optional port, as sanitize_url accepts after
-# the @ that ends a credential.
-_AUTH_TAIL = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:\d{1,5})?$")
+# the @ that ends a credential. Digits alone are never a host (@2024 in a path
+# is a year or a version), but a dotted IPv4 address is.
+_AUTH_TAIL = re.compile(
+    r"^(?!\d+(:\d{1,5})?$)(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:\d{1,5})?$")
 
 
 class EnumerationIncomplete(RuntimeError):
@@ -205,9 +207,11 @@ def sanitize_url(url):
     # anything else the authority is a credential, and the real host is after
     # the last @ whose tail is a host name or address. If no @ qualifies, no
     # host can be told from the secret, so nothing of the url is kept.
-    # shortcut: a password that is one to five digits up to its first / ? or #
-    # looks like a port and is kept, because https://h:6443/x?u=a@b.com is the
-    # common shape and the two cannot be told apart.
+    # shortcut: a password that is one to five digits and then a ? or # looks
+    # like a port followed by a query, and is kept, because
+    # https://h:6443/x?u=a@b.com is the common shape and the two cannot be
+    # told apart. Digits and then a / are told apart: ArcGIS service paths
+    # never hold an @, so an @ in the path after host:port is a credential end.
     head = re.split("[/?#]", rest, maxsplit=1)[0]
     if "@" in head:
         # A password that holds an @ and then a / puts the real host after a
@@ -223,15 +227,22 @@ def sanitize_url(url):
             if at >= 0:
                 cut = len(head) + at + 1
         rest = rest[cut:]
-    elif (":" in head and not head.startswith("[")
-          and not re.fullmatch(r"\d{1,5}", head.rpartition(":")[2])):
-        at = rest.rfind("@")
+    elif ":" in head and not head.startswith("["):
+        portlike = re.fullmatch(r"\d{1,5}", head.rpartition(":")[2]) is not None
+        # A port-like tail searches the path only: the query may hold an e-mail.
+        if portlike:
+            zone = re.split("[?#]", rest[len(head):], maxsplit=1)[0]
+        else:
+            zone = rest
+        base = len(head) if portlike else 0
+        at = zone.rfind("@")
         while at >= 0 and not _AUTH_TAIL.match(
-                re.split("[/?#]", rest[at + 1:], maxsplit=1)[0]):
-            at = rest.rfind("@", 0, at)
-        if at < 0:
+                re.split("[/?#]", zone[at + 1:], maxsplit=1)[0]):
+            at = zone.rfind("@", 0, at)
+        if at >= 0:
+            rest = rest[base + at + 1:]
+        elif not portlike:
             return scheme + sep + "<redacted>"
-        rest = rest[at + 1:]
     rest = rest.split("#", 1)[0]
     rest = rest.split("?", 1)[0]
     authority, slash, path = rest.partition("/")
@@ -2604,6 +2615,21 @@ def self_test():
           "nothing of the url  <-- pinned defect")
     check(sanitize_url("user:Hunter") == "<redacted>",
           "and so does a bare user:word with no scheme")
+    for digit_pw, want_host in (
+            ("https://admin:12/34@gis.example.com/arcgis",
+             "https://gis.example.com/arcgis"),
+            ("https://user:123/abc@h/x", "https://h/x"),
+            ("https://user:1/2@h/x?token=T", "https://h/x"),
+            ("https://u:12345/x@h/y", "https://h/y")):
+        check(sanitize_url(digit_pw) == want_host,
+              "a password of digits and then a / is cut whole, not kept as a "
+              "port: %s  <-- pinned defect" % sanitize_url(digit_pw))
+    check(sanitize_url("https://h:6443/x?u=a@b.com&token=SECRET")
+          == "https://h:6443/x"
+          and sanitize_url("https://h:6443/x/Parcels@2024/MapServer")
+          == "https://h:6443/x/Parcels@2024/MapServer",
+          "a real host:port keeps its port beside a query @ and a path @ "
+          "whose tail is only digits")
     check(sanitize_url("https://[::1]:6443/x?u=a@b.com&token=SECRET")
           == "https://[::1]:6443/x",
           "a bracketed IPv6 host is not mistaken for a credential")
@@ -4141,14 +4167,16 @@ def self_test():
         return shown
     for number, stray in enumerate((
             ["--password", "hunter2"], ["--tok", "hunter2"],
-            ["--tokn=hunter2"], ["-p", "hunter2"], ["hunter2"]), 1):
+            ["--tokn=hunter2"], ["-p", "hunter2"], ["hunter2"],
+            ["-phunter2"]), 1):
         shown = usage_text(["--server", SERVER] + stray)
         check("unrecognized arguments" in shown and "hunter2" not in shown,
-              "an unknown argument, shape %d of 5, is named without the "
+              "an unknown argument, shape %d of 6, is named without the "
               "secret beside it in the error  <-- pinned defect" % number)
     check("--password" in usage_text(["--password", "hunter2"])
           and "--tokn" in usage_text(["--tokn=hunter2"])
-          and "no flag" in usage_text(["hunter2"]),
+          and "no flag" in usage_text(["hunter2"])
+          and usage_text(["-phunter2"]).rstrip().endswith("arguments: -p"),
           "the flag is still named, so the typo can be found")
     check(usage_exit(["--format", "xml"]) == 64
           and usage_exit(["--num", "x"]) == 64,
@@ -4233,8 +4261,8 @@ def self_test():
     probe_passed, probe_failed = passed[0], list(failed)
     passed[0], failed[:] = kept_passed, kept_failed
     check(len(probe_failed) - len(kept_failed) == 13,
-          "the harness records a false check, a missing exception, two wrong "
-          "exceptions, an argv argparse accepted, two bad enumerations, four "
+          "the harness records a false check, a missing exception, a wrong "
+          "exception, an argv argparse accepted, two bad enumerations, four "
           "bad url comparisons and three bad calls as thirteen failures, so a "
           "broken tool turns this self-test red  <-- pinned defect")
     check(probe_passed == kept_passed,
@@ -4280,7 +4308,9 @@ class _Parser(argparse.ArgumentParser):
         # unknown --password or --tok is the secret. Only the flag is named.
         parsed, extras = self.parse_known_args(args, namespace)
         if extras:
-            flags = [a.split("=", 1)[0] for a in extras if a.startswith("-")]
+            # A single-dash flag may carry its value (-pSECRET): two characters.
+            flags = [a.split("=", 1)[0] if a.startswith("--") else a[:2]
+                     for a in extras if a.startswith("-")]
             self.error("unrecognized arguments: %s"
                        % (" ".join(flags) if flags else "a value with no flag"))
         return parsed
