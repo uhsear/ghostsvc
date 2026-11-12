@@ -180,12 +180,12 @@ PASS  a plausible-looking --unpublish is refused, because this tool changes noth
 PASS  the harness records a false check, a missing exception, a wrong exception, an argv argparse accepted, two bad enumerations, four bad url comparisons and three bad calls as thirteen failures, so a broken tool turns this self-test red  <-- pinned defect
 ...
 --------------------------------------------------------------------
-621 assertions, 0 failed
+632 assertions, 0 failed
 ```
 
 ## Requirements
 
-Python 3.9 or newer. The final file's self-test printed `621 assertions, 0 failed` on Windows 3.9.25, 3.10.20, 3.11.8, 3.12.10 and 3.13.2, and on Linux 3.12.3 (run on the festie host with `python3 -W error`). The file parses under the 3.9 grammar (`ast.parse` with `feature_version=(3, 9)`) and uses no f-strings. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
+Python 3.9 or newer. The final file's self-test printed `632 assertions, 0 failed` on Windows 3.9.25, 3.10.20, 3.11.15, 3.12.10 and 3.13.2, and on Linux 3.12.3 (run on the festie host with `python3 -W error`). The file parses under the 3.9 grammar (`ast.parse` with `feature_version=(3, 9)`) and uses no f-strings. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
 `time`, `argparse`, `datetime`, `getpass` and `re`, and `threading`, `http.server`, `tempfile`, `shutil` and `runpy` in the self-test. It
 runs on a plain `python3`. It was not run on ArcGIS Pro's own interpreter, which is a 3.9 build, so that is untested here. `arcpy` is not used and the `arcgis` package
 is not needed.
@@ -402,7 +402,7 @@ followed by one of the six characters.
 |---|---|
 | 0 | Every service has a portal item and none answered without a token. Also: `--no-probe` was given and there is no ghost or orphan. That second case says anonymity was not tested, so read the exit code as an answer about ghosts and orphans only. |
 | 1 | There are findings to review. A finding wins over an unanswered probe. |
-| 2 | The server or the portal could not be read, so no list is given. Also: the report file could not be written, the catalog listed no service and there is no orphan, there is no finding and at least one service could not be probed, there is no finding and the enumeration warned, there is no finding and the token is not an organization administrator's or no token was given (see Limits), the password could not be asked for, or an exception the tool did not foresee ended the run. |
+| 2 | The server or the portal could not be read, so no list is given. Also: the report file could not be written, the catalog listed no service and there is no orphan, there is no finding and at least one service could not be probed, there is no finding and the enumeration warned, there is no finding and an item url under `rest/services` or `admin/services` could not be keyed, there is no finding and the token is not an organization administrator's or no token was given (see Limits), the password could not be asked for, or an exception the tool did not foresee ended the run. |
 | 64 | Usage error, including an unknown flag or a bad value. |
 
 ## Limits
@@ -455,8 +455,12 @@ followed by one of the six characters.
 - A token or password inside the url you pass as `--server` or `--portal`, or inside an item's url,
   is dropped before anything is requested, printed or written, including the `referer` posted to
   `generateToken`. The authority ends at the first `/`, `?` or `#`, and an `@` inside it ends the
-  credential. A query `@`, such as `?e=a@b.com`, is never a credential end, so the query is
-  dropped whole and the token in it goes too. A path `@` is not one either, unless the url
+  credential. A query `@`, such as `?e=a@b.com`, is not a credential end, so the query is
+  dropped whole and the token in it goes too. The one exception is a password that holds `/`, `?` or `#`: the
+  tool must then search the rest of the url for the real host, and it accepts an `@` only when a host name or
+  address follows it and a `/` or `?` follows that host. A query `@` that ends the url or is followed by `#`
+  is never taken, so `https://u:p/x@host/a?u=a@Zq9` keeps `host` and prints nothing of `Zq9`. A query value
+  such as `?e=a@b.com/foo` has a `/` after the host and is still read as the credential end. A path `@` is not one either, unless the url
   carries a user and password: then a later `@` in the path whose tail is a host name ends the
   credential, so `https://u:p@ss/w@host/x` keeps `host`. A password that itself holds `/`, `?` or `#` makes the
   text before that character look like `user:part`, because a host port is digits only. The tool then
@@ -511,8 +515,10 @@ followed by one of the six characters.
   `unreadable_items[].url` when that item url cannot be keyed.
 - `--format csv` or `--format json` without `--out` is ignored without a warning, and nothing is written.
 - An item url that looks like a service but cannot be keyed, such as `.../rest/services/Roads/MapServer/export`,
-  is counted under could not read and is not reconciled. The output says so, but the exit code stays 0
-  when every service has an item, so exit 0 does not prove the orphan side was checked.
+  is counted under could not read and is not reconciled, so a deleted service behind it is not reported as an
+  orphan. The run adds a caveat and exits 2 when it has no finding, the same as for an enumeration warning.
+  An item url with no service path under `rest/services` or `admin/services`, such as a web map page or the
+  catalog root, is not read as a service claim and does not change the exit code.
 - A `+` in an item url is not read as a space. `.../Road+A/MapServer` keys as `road+a`, not `road a`, so it
   shows as a ghost and an orphan together. Browsers write a space as `%20`, so this is rare.
 - The console echo lines and the report lines are made safe for the console code page: a character
@@ -542,6 +548,10 @@ followed by one of the six characters.
   your own portal first. `--token` avoids the question.
 - `--username` posts the password to the scheme of `--portal`. An `http://` portal sends it in clear
   text. Only `--insecure` is refused with `--username`, so use an `https://` portal.
+- `--insecure` also exposes a `--token` or `GHOSTSVC_TOKEN` value to anyone who can intercept the connection.
+  Only the password is refused with `--insecure`.
+- Text from the portal or the server is printed as it comes: item titles, item urls and the reason text of a
+  failed probe. A control or escape character in it reaches the terminal, so run the tool in a terminal you trust.
 - `--token` puts a token on the command line, where shell history and the process list can read it. Use
   `GHOSTSVC_TOKEN`, and prefer it for scheduled jobs. The token travels in the query string of every request, which is how the Esri
   `token` parameter works, so it lands in server and proxy access logs.
@@ -556,11 +566,11 @@ followed by one of the six characters.
   `-` or `@`, and a formula character after a space, are not guarded.
 - A service type that is not in the tool's list of ArcGIS service types stops the run with exit 2,
   because the key cannot be built. That is a refusal, not a guess. Add the type to `SERVICE_TYPES`.
-- Coverage is 100 percent of statements and branches on Windows 3.13.2, 2052 statements and 430
+- Coverage is 100 percent of statements and branches on Windows 3.13.2, 2074 statements and 436
   branches, with no line left out (`python -m coverage run --branch ghostsvc.py --self-test`, then
   `python -m coverage report -m`). Linux was run without the coverage module, so the Linux run proves
-  the assertions and not the percentage. The Windows 3.9.25, 3.10.20, 3.11.8, 3.12.10 and 3.13.2 runs and the
-  Linux 3.12.3 run all print 621 assertions, because the self-test does not branch on the host.
+  the assertions and not the percentage. The Windows 3.9.25, 3.10.20, 3.11.15, 3.12.10 and 3.13.2 runs and the
+  Linux 3.12.3 run all print 632 assertions, because the self-test does not branch on the host.
 
 - The CSV excerpt above was captured from the real-socket block with a one-off script. The self-test asserts the same cells but does not print them.
 - A token carried as a `;token=` path parameter in `--server`, `--portal` or an item url is kept in the output. Only the query, the fragment and the user and password are cut.

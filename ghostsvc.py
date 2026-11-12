@@ -170,6 +170,23 @@ _AUTH_TAIL = re.compile(
     r"^(?!\d+(:\d{1,5})?$)(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:\d{1,5})?$")
 
 
+def _host_then_path(tail):
+    """True when tail is a host name or address that a / or ? follows.
+
+    A password holding / ? or # leaves a query inside the text that sanitize_url
+    searches for the credential end, so a query e-mail such as ?u=a@b.com is a
+    candidate too. The real host is followed by its path or its own query. A
+    candidate that ends the url or is followed by # is a query value.
+    """
+    found = re.match("([^/?#]*)([/?#]?)", tail)
+    return found.group(2) in ("/", "?") and _AUTH_TAIL.match(
+        found.group(1)) is not None
+
+
+# A service path after the catalog marker, in a url too odd to key.
+_CATALOG_PATH = re.compile(r"/(rest|admin)/services/[^/]", re.IGNORECASE)
+
+
 class EnumerationIncomplete(RuntimeError):
     """The portal or the server could not be listed, so no reconcile is given.
 
@@ -236,8 +253,7 @@ def sanitize_url(url):
             zone = rest
         base = len(head) if portlike else 0
         at = zone.rfind("@")
-        while at >= 0 and not _AUTH_TAIL.match(
-                re.split("[/?#]", zone[at + 1:], maxsplit=1)[0]):
+        while at >= 0 and not _host_then_path(zone[at + 1:]):
             at = zone.rfind("@", 0, at)
         if at >= 0:
             rest = rest[base + at + 1:]
@@ -1030,6 +1046,19 @@ def reconcile(services, items, anonymous=(), details=None, probes=None,
             continue
         by_key.setdefault(key, []).append(raw)
 
+    report_caveats = []
+    doubtful = [rec for rec in unreadable if _CATALOG_PATH.search(rec["url"])]
+    if doubtful:
+        # The url names a catalog path this tool cannot key, such as
+        # .../MapServer/export. The service behind it is never matched, so a
+        # deleted one would not show as an orphan. That is the same doubt as an
+        # enumeration warning, so it is reported and the run exits 2.
+        report_caveats.append(
+            "%d portal item(s) have a url under rest/services or "
+            "admin/services that could not be keyed, so a deleted service "
+            "behind one of them would not show as an orphan"
+            % len(doubtful))
+
     findings = []
     for svc in services:
         key = svc["key"]
@@ -1059,8 +1088,10 @@ def reconcile(services, items, anonymous=(), details=None, probes=None,
                 # it is never probed and its anonymity is unknown.
                 findings.append(Finding("orphan", key, None, [raw],
                                         tested=False))
-    return Report(findings, list(services), list(items), unreadable,
-                  probes=probes)
+    report = Report(findings, list(services), list(items), unreadable,
+                    probes=probes)
+    report.caveats.extend(report_caveats)
+    return report
 
 
 def build_report(server, portal, query, taken, report):
@@ -2406,6 +2437,24 @@ def self_test():
           "and the report names them")
     check(mixed.unreadable[0]["url"] in ("", "https://portal/home/item.html"),
           "an unreadable item still carries whatever url it had")
+    check(mixed.caveats == [] and exit_code(mixed) == 0,
+          "a web page url is no doubt about the orphan side, so it exits 0")
+    for odd in (REST + "/Deleted/MapServer/export",
+                REST + "/Deleted/FeatureServer/0/query",
+                REST.replace("/rest/", "/ADMIN/") + "/Deleted/MapServer/x"):
+        doubt = reconcile([roads], [item("i1", REST + "/Roads/MapServer"),
+                                    item("i2", odd)])
+        check(doubt.findings == [] and len(doubt.unreadable) == 1
+              and len(doubt.caveats) == 1 and exit_code(doubt) == 2
+              and "could not be keyed" in doubt.caveats[0]
+              and any("caveat above" in line for line in describe(doubt)),
+              "an item url under the catalog that cannot be keyed is doubt "
+              "about the orphan side, so it exits 2 and says so, not 0: %s  "
+              "<-- pinned defect" % odd)
+    catalog_root = reconcile([roads], [item("i1", REST + "/Roads/MapServer"),
+                                       item("i2", REST)])
+    check(catalog_root.caveats == [] and exit_code(catalog_root) == 0,
+          "an item that points at the catalog root claims no service")
 
     cross = reconcile([svc("Roads", host="gis.example.org"),
                        svc("Roads", host="gis2.example.org")],
@@ -2655,6 +2704,26 @@ def self_test():
           == "https://h:6443",
           "and a credential with a / before a path-less query @ is still "
           "cut whole  <-- pinned defect")
+    for tailed in (
+            "https://u:p/x@h.example.com/arcgis/rest/services/A/MapServer"
+            "?u=a@Zq9XkTok",
+            "https://u:p/x@h.example.com/arcgis/rest/services/A/MapServer"
+            "?token=T&u=a@b.com",
+            "https://u:p/x@h.example.com/arcgis/rest/services/A/MapServer"
+            "?token=T&u=a@b.com#frag"):
+        check(sanitize_url(tailed) == "https://h.example.com/arcgis/rest/"
+              "services/A/MapServer",
+              "a password holding / does not let a query @ end the "
+              "credential, so neither a token nor an e-mail domain becomes "
+              "the host: %s  <-- pinned defect" % sanitize_url(tailed))
+    check(sanitize_url("https://u:p/x@h.example.com/a?e=a@b.com/foo")
+          == "https://b.com/foo",
+          "the known limit: a query @ with a host and a / after it is still "
+          "read as the credential end, which the Limits name")
+    check(sanitize_url("https://u:p/x@Zq9XkTok") == "https://<redacted>"
+          and sanitize_url("https://u:p/x?e=a@Zq9XkTok") == "https://<redacted>",
+          "and with no host that a path follows nothing of the url is kept  "
+          "<-- pinned defect")
     check(item_record({"id": "x", "url": "https://u:ITEMPW@gis.example.org/"
                        "arcgis/rest/services/Old/MapServer"})["url"]
           == "https://gis.example.org/arcgis/rest/services/Old/MapServer",
@@ -4196,6 +4265,10 @@ def self_test():
             "would otherwise take --ap for --apply  <-- pinned defect")
     check(_parse(["--server", SERVER, "--insecure"]).insecure is True,
           "--insecure is read")
+    insecure_token = _parse(["--server", SERVER, "--insecure", "--token", "T"])
+    check(insecure_token.insecure is True and insecure_token.token == "T",
+          "--insecure with --token is accepted, the Limits say what that "
+          "exposes")
     check(_parse(["--server", SERVER, "--admin"]).admin is True,
           "--admin is read")
     check(_parse(["--server", SERVER, "--no-probe"]).no_probe is True,
@@ -4553,7 +4626,7 @@ def _main(argv):
             writer = write_csv if args.format == "csv" else write_json
             print("")
             try:
-                print("wrote %s" % writer(document, args.out))
+                say("wrote %s" % writer(document, args.out))
             except OSError as exc:
                 print("error: could not write %s: %s. Close the file if it is "
                       "open in another program, or choose another --out."
