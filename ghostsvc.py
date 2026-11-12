@@ -3853,6 +3853,14 @@ def self_test():
         check(code == 1 and "type:" in seen,
               "--query replaces the org query and is reported back")
 
+        code, seen = captured(lambda: serving(site(), lambda: main(
+            ARGV + ["--query", "title:" + chr(0x4e2d)])), encoding="cp1252")
+        check(code == 1 and "query: title:?" in seen
+              and "UnicodeEncodeError" not in seen and "error:" not in seen,
+              "a --query a cp1252 console cannot encode is echoed with a "
+              "replacement and the run finishes, not exit 2  "
+              "<-- pinned defect")
+
         code, seen = captured(lambda: serving(
             site(open_error=lambda t: ValueError("unknown url type: %r" % t)),
             lambda: main(ARGV)))
@@ -4470,10 +4478,15 @@ def _main(argv):
         print("error: --max-folders must be at least 1.", file=sys.stderr)
         return 64
 
+    encoding = getattr(sys.stdout, "encoding", None)
+
+    def say(line):
+        print(printable(line, encoding))
+
     try:
         token = _authenticate(args)
         root = server_root(args.server)
-        print("server: %s" % root)
+        say("server: %s" % root)
         services = walk_catalog(
             catalog_fetch(root, token, args.admin, args.insecure), root,
             args.max_folders)
@@ -4488,12 +4501,12 @@ def _main(argv):
             if not oid:
                 raise RuntimeError("could not read the org id, pass --query")
             query = "orgid:%s" % oid
-        print("portal: %s" % sanitize_url(args.portal))
-        print("query: %s" % query)
+        say("portal: %s" % sanitize_url(args.portal))
+        say("query: %s" % query)
         items, warnings = enumerate_items(
             portal_fetch(args.portal, token, args.insecure), base=query,
             now_ms=None, num=args.num, max_partitions=args.max_partitions,
-            echo=lambda line: print(line))
+            echo=say)
 
         anonymous, details, probes = set(), {}, {}
         if not args.no_probe:
@@ -4501,7 +4514,7 @@ def _main(argv):
             unanswered = set()
             anonymous, details = probe_all(services, args.insecure,
                                            args.timeout,
-                                           echo=lambda line: print(line),
+                                           echo=say,
                                            unanswered=unanswered)
             probes = dict((svc["key"], svc["key"] not in unanswered)
                           for svc in services)
@@ -4526,9 +4539,8 @@ def _main(argv):
         report.caveats.append(caveat)
 
     print("")
-    encoding = getattr(sys.stdout, "encoding", None)
     for line in describe(report):
-        print(printable(line, encoding))
+        say(line)
 
     if args.out:
         document = build_report(args.server, args.portal, query,

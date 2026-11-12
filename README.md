@@ -180,12 +180,12 @@ PASS  a plausible-looking --unpublish is refused, because this tool changes noth
 PASS  the harness records a false check, a missing exception, a wrong exception, an argv argparse accepted, two bad enumerations, four bad url comparisons and three bad calls as thirteen failures, so a broken tool turns this self-test red  <-- pinned defect
 ...
 --------------------------------------------------------------------
-620 assertions, 0 failed
+621 assertions, 0 failed
 ```
 
 ## Requirements
 
-Python 3.9 or newer. The final file's self-test printed `620 assertions, 0 failed` on Windows 3.9.25, 3.10.20, 3.11.15, 3.12.10 and 3.13.2, and on Linux 3.12.3 (run on the festie host with `python3 -W error`). The file parses under the 3.9 grammar (`ast.parse` with `feature_version=(3, 9)`) and uses no f-strings. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
+Python 3.9 or newer. The final file's self-test printed `621 assertions, 0 failed` on Windows 3.9.25, 3.10.20, 3.11.8, 3.12.10 and 3.13.2, and on Linux 3.12.3 (run on the festie host with `python3 -W error`). The file parses under the 3.9 grammar (`ast.parse` with `feature_version=(3, 9)`) and uses no f-strings. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
 `time`, `argparse`, `datetime`, `getpass` and `re`, and `threading`, `http.server`, `tempfile`, `shutil` and `runpy` in the self-test. It
 runs on a plain `python3`. It was not run on ArcGIS Pro's own interpreter, which is a 3.9 build, so that is untested here. `arcpy` is not used and the `arcgis` package
 is not needed.
@@ -347,8 +347,10 @@ a ghost that does not exist.
 ## What it refuses
 
 It never changes anything on the server or in the portal. The calls it makes are `rest/services`, `admin/services`,
-`sharing/rest/search`, `portals/self`, `generateToken` and, for each ghost, one anonymous GET of the service
-itself (the probe), and the self-test asserts that a
+`sharing/rest/search`, `portals/self`, `generateToken` and, for every service in the catalog, one
+anonymous GET of the service itself (the probe). A service that has a portal item is probed too, because
+the probe is what finds an item that is shared more widely than it should be. `--no-probe` skips those
+GETs. The self-test asserts that a
 plausible-looking `--unpublish` and `--delete-ghosts` are rejected rather than ignored.
 
 It refuses to produce a ghost list from an item enumeration it cannot prove is complete. `search`
@@ -447,8 +449,9 @@ followed by one of the six characters.
 - The guard applies to the CSV only. The JSON report carries the raw text.
 - A non-text value in a text column is written as its text, so a `None` would read as `None`.
   Portal records never carry one, because a missing title or owner becomes an empty string first.
-- Item titles and service names are printed to the terminal as they are, so a control or escape
-  character in published text reaches the console.
+- Item titles are printed to the terminal as they are, so a control or escape character in a title
+  reaches the console. Service names are not: they are percent-encoded before they are printed, so
+  a service name shows only ASCII in every report line.
 - A token or password inside the url you pass as `--server` or `--portal`, or inside an item's url,
   is dropped before anything is requested, printed or written, including the `referer` posted to
   `generateToken`. The authority ends at the first `/`, `?` or `#`, and an `@` inside it ends the
@@ -483,8 +486,8 @@ followed by one of the six characters.
   clean result. Missing items can only add false ghosts, but an orphan could go unseen, so read the
   warnings and run again.
 - A catalog read with a token that cannot see every service reports only the services that token
-  may list. An empty catalog next to an empty portal exits 0 and prints the sentence that every
-  service has an item, which is vacuous for zero services.
+  may list. A token that can list nothing gives an empty catalog, which exits 2 (see the limit on an
+  empty catalog below).
 - The item side comes from `search`, and Esri says "The results of a search only contain items that
   the user has permission to access". A token that is not an organization administrator's can miss
   an item that is private to another user, and its service then reads as a ghost although the item
@@ -512,15 +515,15 @@ followed by one of the six characters.
   when every service has an item, so exit 0 does not prove the orphan side was checked.
 - A `+` in an item url is not read as a space. `.../Road+A/MapServer` keys as `road+a`, not `road a`, so it
   shows as a ghost and an orphan together. Browsers write a space as `%20`, so this is rare.
-- The console echo lines (`ANONYMOUS ...`, the item count, the `--query` echo) are printed as they are. On a
-  redirected Windows console (cp1252) a service name or `--query` with a letter outside the code page ends the
-  run with `error: unexpected UnicodeEncodeError` and exit 2, after the network work is done.
+- The console echo lines and the report lines are made safe for the console code page: a character
+  the code page cannot hold is printed as `?`, so a `--query` or an item title with such a letter
+  does not end the run. The JSON and CSV files keep the original text.
 - When argparse rejects the value of a known flag (`--num`, `--timeout`, `--max-partitions`,
   `--max-folders`, `--format`), it prints that value. A secret typed into one of those flags is echoed.
 - The self-test sets and deletes `GHOSTSVC_PASSWORD` and `GHOSTSVC_TOKEN` in its own process, so a real value
   in the environment is gone for the rest of that process only.
 - A catalog that lists no service exits 2 and says so, because a wrong `--server` and a token that can list nothing give the same empty answer as a server with no service. A portal item beside an empty catalog is still an orphan, exit 1.
-- An error line printed to stderr is not re-encoded. A portal message with characters outside the console code page can turn into `unexpected UnicodeEncodeError` on a redirected Windows console. The exit code stays correct.
+- An error line printed to stderr is not re-encoded. Python writes stderr with a replacement for a character the console cannot hold, so a portal message with such a character does not end the run in an encoding error, and the exit code stays 2.
 - A token or password given in `--server` is cut from the output, but `--token` itself stays on the command line. A scheduled job should use `GHOSTSVC_TOKEN` only.
 - A cell with leading whitespace before a formula character is not guarded. The strip rule cannot
   distinguish a guarded cell from source text that began with an apostrophe.
@@ -534,6 +537,9 @@ followed by one of the six characters.
   under a scheduler, so set `GHOSTSVC_PASSWORD` there. A password cannot be piped on stdin on
   Windows: `--username bob` with stdin redirected from the null device did not return. The exit 2 holds only where `getpass` falls
   back to stdin, such as cron on Linux.
+- The `--username` sign-in asks `generateToken` for a referer-bound token (`client=referer`) and sends no
+  `Referer` header on the calls after it. It was exercised only against a local stand-in, so test it on
+  your own portal first. `--token` avoids the question.
 - `--username` posts the password to the scheme of `--portal`. An `http://` portal sends it in clear
   text. Only `--insecure` is refused with `--username`, so use an `https://` portal.
 - `--token` puts a token on the command line, where shell history and the process list can read it. Use
@@ -550,11 +556,11 @@ followed by one of the six characters.
   `-` or `@`, and a formula character after a space, are not guarded.
 - A service type that is not in the tool's list of ArcGIS service types stops the run with exit 2,
   because the key cannot be built. That is a refusal, not a guess. Add the type to `SERVICE_TYPES`.
-- Coverage is 100 percent of statements and branches on Windows 3.13.2, 2048 statements and 430
+- Coverage is 100 percent of statements and branches on Windows 3.13.2, 2052 statements and 430
   branches, with no line left out (`python -m coverage run --branch ghostsvc.py --self-test`, then
   `python -m coverage report -m`). Linux was run without the coverage module, so the Linux run proves
-  the assertions and not the percentage. The Windows 3.9.25, 3.10.20, 3.11.15, 3.12.10 and 3.13.2 runs and the
-  Linux 3.12.3 run all print 620 assertions, because the self-test does not branch on the host.
+  the assertions and not the percentage. The Windows 3.9.25, 3.10.20, 3.11.8, 3.12.10 and 3.13.2 runs and the
+  Linux 3.12.3 run all print 621 assertions, because the self-test does not branch on the host.
 
 - The CSV excerpt above was captured from the real-socket block with a one-off script. The self-test asserts the same cells but does not print them.
 - A token carried as a `;token=` path parameter in `--server`, `--portal` or an item url is kept in the output. Only the query, the fragment and the user and password are cut.
