@@ -37,8 +37,8 @@ also makes a temporary directory and removes it again.)
 Exit codes: 0 every service has an item and none answered anonymously (or
 --no-probe was given and no ghost or orphan was found), 1 there are findings to
 review, 2 the server or the portal could not be read, the report could not be
-written, or a service could not be probed and nothing else was found, 64 usage
-error.
+written, the catalog listed no service, or a service could not be probed and
+nothing else was found, 64 usage error.
 """
 
 from __future__ import print_function
@@ -210,7 +210,19 @@ def sanitize_url(url):
     # common shape and the two cannot be told apart.
     head = re.split("[/?#]", rest, maxsplit=1)[0]
     if "@" in head:
-        rest = rest[len(head.rpartition("@")[0]) + 1:]
+        # A password that holds an @ and then a / puts the real host after a
+        # later @ in the path, so the path is searched for a host-shaped tail.
+        # The query and fragment are not: an e-mail address lives there.
+        cut = len(head.rpartition("@")[0]) + 1
+        if ":" in head.rpartition("@")[0]:
+            path = re.split("[?#]", rest[len(head):], maxsplit=1)[0]
+            at = path.rfind("@")
+            while at >= 0 and not _AUTH_TAIL.match(
+                    re.split("/", path[at + 1:], maxsplit=1)[0]):
+                at = path.rfind("@", 0, at)
+            if at >= 0:
+                cut = len(head) + at + 1
+        rest = rest[cut:]
     elif (":" in head and not head.startswith("[")
           and not re.fullmatch(r"\d{1,5}", head.rpartition(":")[2])):
         at = rest.rfind("@")
@@ -962,7 +974,8 @@ class Report(object):
 
     @property
     def probe_skipped(self):
-        return self.probes is not None and not self.probes
+        # With no service there is nothing to probe, and that is not a skip.
+        return bool(self.services) and self.probes is not None             and not self.probes
 
     @property
     def probe_failed(self):
@@ -1150,7 +1163,11 @@ def describe(report):
                    "they answer." % (len(report.untested), len(report.services)))
     out.append("")
     if not report.findings:
-        if report.warnings:
+        if not report.services:
+            out.append("The server catalog listed no services, so there was "
+                       "nothing to compare or probe. Check --server and the "
+                       "token. This is not a clean result.")
+        elif report.warnings:
             out.append("No finding, but the enumeration warned above, so this "
                        "is not a clean result. Run again.")
         elif report.caveats:
@@ -1198,13 +1215,16 @@ def exit_code(report):
     A run that skipped the probe on request (--no-probe) answered the only
     question it was asked, so it is not unsure.
 
+    A catalog with no service is unsure too: a wrong --server or a token that
+    can list nothing gives the same empty answer as a server with no service.
+
     An enumeration warning is the same kind of doubt. A portal that moved while
     it was read may hold an item this run never saw, so a run with no finding
     and a warning is not clean.
     """
     if report.findings:
         return 1
-    unsure = (report.warnings or report.caveats
+    unsure = (not report.services or report.warnings or report.caveats
               or (report.untested and not report.probe_skipped))
     return 2 if unsure else 0
 
@@ -1472,9 +1492,13 @@ def role_caveat(me, token):
     search only returns items the signed-in user may access, so a token that is
     not an organization administrator's can miss an item that is private to
     another user, and the live service behind it then reads as a ghost.
+    With no token the search sees public items only, which is the same doubt.
     """
     if not token:
-        return None
+        return ("no token was given, so the portal search saw public items "
+                "only. An item shared to the organization or private is not "
+                "seen and its service may be listed as a ghost. Run with an "
+                "administrator's token before you act.")
     user = me.get("user")
     role = user.get("role") if isinstance(user, dict) else None
     if role == "org_admin":
@@ -2337,7 +2361,18 @@ def self_test():
     nothing = reconcile([], [])
     check(nothing.findings == [] and nothing.matched == 0,
           "an empty server and an empty portal reconcile to nothing")
-    check(exit_code(nothing) == 0, "and that exits 0")
+    check(exit_code(nothing) == 2 and not nothing.probe_skipped
+          and any("listed no services" in line for line in describe(nothing))
+          and not any("probe was not run" in line
+                      or "--no-probe" in line for line in describe(nothing)),
+          "but an empty catalog is not a clean run: it exits 2 and says so, "
+          "and does not claim a skipped probe that nobody asked for  "
+          "<-- pinned defect")
+    check(exit_code(reconcile([], [], probes={})) == 2,
+          "with --no-probe an empty catalog exits 2 as well  "
+          "<-- pinned defect")
+    check(exit_code(reconcile([], [item("i1", REST + "/Roads/MapServer")]))
+          == 1, "and an empty catalog beside an item is still an orphan, 1")
     no_portal = reconcile([roads, rail], [])
     check(len(no_portal.findings) == 2
           and all(f.kind == "ghost" for f in no_portal.findings),
@@ -2515,6 +2550,18 @@ def self_test():
                            % dirty_pw) == "http://gis.example.org/arcgis",
               "a password holding %r is removed whole  <-- pinned defect"
               % dirty_pw)
+    for slashed in ("https://admin:p@ss/w@gis.example.com/arcgis",
+                    "https://admin:p@ss/w/x@gis.example.com/arcgis",
+                    "https://admin:p@ss/w@gis.example.com/arcgis?e=a@b.com"):
+        check(sanitize_url(slashed) == "https://gis.example.com/arcgis",
+              "a password holding @ then / is cut whole, so no tail of it "
+              "reaches the output: %s  <-- pinned defect"
+              % sanitize_url(slashed))
+    check(sanitize_url("https://user@gis.example.org/arcgis")
+          == "https://gis.example.org/arcgis",
+          "a user name with no password is removed too")
+    check(sanitize_url("https://u:p@h/a@h2/b@!") == "https://h2/b@!",
+          "the path search skips an @ whose tail is not a host name")
     check(sanitize_url("gis.example.org/a?next=https://x/y")
           == "gis.example.org/a",
           "a :// inside a query string is not taken for a scheme")
@@ -3535,14 +3582,26 @@ def self_test():
         code, seen = captured(lambda: serving(
             site(), lambda: main(["--server", SERVER, "--portal", PORTAL,
                                   "--query", "owner:ann"])))
-        check("CAVEATS" not in seen,
-              "and a run with no token has no role to judge")
+        check(code == 1 and "CAVEATS" in seen
+              and "no token was given" in seen,
+              "a run with no token says the search saw public items only, "
+              "because an org-shared item would read as a ghost  "
+              "<-- pinned defect")
+        empty_site = site(catalog=Catalog([]),
+                          folders={"": {"folders": [], "services": []}})
+        code, seen = captured(lambda: serving(
+            empty_site, lambda: main(ARGV)))
+        check(code == 2 and "listed no services" in seen
+              and "probe was not run" not in seen
+              and "--no-probe was given" not in seen,
+              "a catalog that lists no service exits 2 and does not say the "
+              "probe was skipped when it was not  <-- pinned defect")
         check(role_caveat({}, "T").endswith("before you act.")
               and "role is unknown" in role_caveat({}, "T")
               and "role is unknown" in role_caveat({"user": "x"}, "T")
               and "role is unknown" in role_caveat({"user": {"role": 5}}, "T")
               and role_caveat({"user": {"role": "org_admin"}}, "T") is None
-              and role_caveat({}, None) is None,
+              and "public items only" in role_caveat({}, None),
               "a missing or odd role reads as unknown, never as an admin")
         code, seen = captured(lambda: serving(
             site(anonymous=(), down=["Roads/MapServer"],
