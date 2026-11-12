@@ -163,6 +163,10 @@ _TYPE_BY_LOWER = dict((t.lower(), t) for t in SERVICE_TYPES)
 
 _HOST_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
 
+# A host name or address with an optional port, as sanitize_url accepts after
+# the @ that ends a credential.
+_AUTH_TAIL = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:\d{1,5})?$")
+
 
 class EnumerationIncomplete(RuntimeError):
     """The portal or the server could not be listed, so no reconcile is given.
@@ -192,26 +196,29 @@ def sanitize_url(url):
     if not scheme.isalnum():
         # No scheme: a "://" inside a query string is not one.
         scheme, sep, rest = "", "", raw
-    # A password may hold a / ? or # that RFC 3986 would read as the end of the
-    # authority, so the credential is cut at an @ found by searching the whole
-    # rest, last first. An @ is refused as the credential end when it sits in a
-    # query or fragment: either a key=value or & lies between the ? or # and the
-    # @ (e=a@b.com), or a / precedes the ? or # (the authority has ended), or
-    # the text after it up to the next / ? or # is no host (x.com&token=T).
-    # Cutting at such an @ would print the rest of the query, token included.
-    # shortcut: a password that holds ?x=y before its @ is read as a query and
-    # keeps its first part, which no real password does.
-    marks = [i for i in (rest.find("?"), rest.find("#")) if i >= 0]
-    at = rest.rfind("@")
-    while at >= 0:
-        in_query = bool(marks) and min(marks) < at and (
-            "/" in rest[:min(marks)] or any(
-                c in rest[min(marks):at] for c in "=&"))
-        tail = re.split("[/?#]", rest[at + 1:], maxsplit=1)[0]
-        if not in_query and not any(c in tail for c in "=&"):
-            break
-        at = rest.rfind("@", 0, at)
-    if at >= 0 and ":" in rest[:at]:
+    # RFC 3986 ends the authority at the first / ? or #. An @ inside it is the
+    # end of the user:password, so the cut is at the last one. A query or path
+    # @ lies after that first delimiter and is never a credential end.
+    # A password may itself hold a / ? or #. Then the text before the first
+    # delimiter is user:<part of the password>, and a real host:port has only
+    # digits (at most five) after its colon. When the colon is followed by
+    # anything else the authority is a credential, and the real host is after
+    # the last @ whose tail is a host name or address. If no @ qualifies, no
+    # host can be told from the secret, so nothing of the url is kept.
+    # shortcut: a password that is one to five digits up to its first / ? or #
+    # looks like a port and is kept, because https://h:6443/x?u=a@b.com is the
+    # common shape and the two cannot be told apart.
+    head = re.split("[/?#]", rest, maxsplit=1)[0]
+    if "@" in head:
+        rest = rest[len(head.rpartition("@")[0]) + 1:]
+    elif (":" in head and not head.startswith("[")
+          and not re.fullmatch(r"\d{1,5}", head.rpartition(":")[2])):
+        at = rest.rfind("@")
+        while at >= 0 and not _AUTH_TAIL.match(
+                re.split("[/?#]", rest[at + 1:], maxsplit=1)[0]):
+            at = rest.rfind("@", 0, at)
+        if at < 0:
+            return scheme + sep + "<redacted>"
         rest = rest[at + 1:]
     rest = rest.split("#", 1)[0]
     rest = rest.split("?", 1)[0]
@@ -222,7 +229,7 @@ def sanitize_url(url):
 def _short_host(host):
     """The name a host is known by, with its domain dropped.
 
-    gis and gis.county.example.org are one machine, and a portal item created
+    gis and gis.example.org are one machine, and a portal item created
     from inside the network usually carries the short form while the server
     catalog reports the fully qualified one. Taking the first label reconciles
     them.
@@ -928,6 +935,7 @@ class Report(object):
         self.items = items
         self.unreadable = list(unreadable)
         self.warnings = list(warnings)
+        self.caveats = []
 
     def of_kind(self, kind):
         return [f for f in self.findings if f.kind == kind]
@@ -1047,6 +1055,7 @@ def build_report(server, portal, query, taken, report):
         "anonymous": len(report.anonymous),
         "unprobed": len(report.untested),
         "warnings": list(report.warnings),
+        "caveats": list(report.caveats),
         "unreadable_items": sorted(report.unreadable, key=lambda r: r["id"]),
         "findings": [finding_record(f) for f in report.findings],
     }
@@ -1127,6 +1136,11 @@ def describe(report):
             out.append("  - %s" % warning)
         out.append("The portal changed while it was being read, so a service "
                    "below may have an item after all.")
+    if report.caveats:
+        out.append("")
+        out.append("CAVEATS")
+        for caveat in report.caveats:
+            out.append("  - %s" % caveat)
     if report.probe_skipped:
         out.append("The anonymous probe was not run, so nothing is known "
                    "about who can read these services.")
@@ -1139,6 +1153,9 @@ def describe(report):
         if report.warnings:
             out.append("No finding, but the enumeration warned above, so this "
                        "is not a clean result. Run again.")
+        elif report.caveats:
+            out.append("No finding, but the caveat above means the item side "
+                       "may be incomplete, so this is not a clean result.")
         elif report.probe_skipped:
             out.append("Every service on the server has a portal item, but "
                        "--no-probe was given, so nothing is known about who "
@@ -1187,7 +1204,8 @@ def exit_code(report):
     """
     if report.findings:
         return 1
-    unsure = report.warnings or (report.untested and not report.probe_skipped)
+    unsure = (report.warnings or report.caveats
+              or (report.untested and not report.probe_skipped))
     return 2 if unsure else 0
 
 
@@ -1436,12 +1454,35 @@ def generate_token(url, username, secret, insecure=False):
     return token
 
 
+def portal_self(url, token, insecure=False):
+    """The portals/self answer: the organization, and the user with a token."""
+    params = {"token": token} if token else {}
+    return portal_call(url, "portals/self", params, insecure=insecure,
+                       secret=token)
+
+
 def org_id(url, token, insecure=False):
     """The signed-in organization's id, or None when the portal will not say."""
-    params = {"token": token} if token else {}
-    body = portal_call(url, "portals/self", params, insecure=insecure,
-                       secret=token)
-    return body.get("id")
+    return portal_self(url, token, insecure).get("id")
+
+
+def role_caveat(me, token):
+    """A sentence when the token is not an administrator's, else None.
+
+    search only returns items the signed-in user may access, so a token that is
+    not an organization administrator's can miss an item that is private to
+    another user, and the live service behind it then reads as a ghost.
+    """
+    if not token:
+        return None
+    user = me.get("user")
+    role = user.get("role") if isinstance(user, dict) else None
+    if role == "org_admin":
+        return None
+    return ("the signed-in role is %s, not org_admin, so an item private to "
+            "another user is not seen and its service may be listed as a "
+            "ghost. Run with an administrator's token before you act."
+            % (role if isinstance(role, str) and role else "unknown"))
 
 
 def portal_fetch(url, token, insecure=False):
@@ -1464,6 +1505,18 @@ def write_json(document, path):
     return path
 
 
+def render_csv(document, handle):
+    """Write the report as CSV rows to an open text handle.
+
+    Split from write_csv so the self-test can render into memory and no file is
+    written outside --apply.
+    """
+    writer = csv.writer(handle)
+    writer.writerow(CSV_FIELDS)
+    for row in csv_rows(document):
+        writer.writerow(row)
+
+
 def write_csv(document, path):
     """Write the report as CSV and return the path.
 
@@ -1473,10 +1526,7 @@ def write_csv(document, path):
     """
     _make_parent(path)
     with io.open(path, "w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(CSV_FIELDS)
-        for row in csv_rows(document):
-            writer.writerow(row)
+        render_csv(document, handle)
     return path
 
 
@@ -2491,9 +2541,33 @@ def self_test():
           == "https://h:6443/x",
           "an @ in a fragment is read the same way  <-- pinned defect")
     check(sanitize_url("https://h:6443/arcgis/rest/services/Parcels@2024/"
-                       "MapServer") == "https://2024/MapServer",
-          "known limit: an @ in the path of a url that has a port is read as "
-          "a credential separator and the host is cut off")
+                       "MapServer") == "https://h:6443/arcgis/rest/services/"
+          "Parcels@2024/MapServer",
+          "an @ in the path of a url that has a port is not a credential "
+          "separator, so the host stays  <-- pinned defect")
+    for leaky in ("https://user:p?a=b@h/x", "https://user:pa#x=1@h/x",
+                  "https://user:Hunter?pw=1@h/x"):
+        check(sanitize_url(leaky) == "https://h/x",
+              "a password holding ? or # before its @ is cut whole, user "
+              "name and password prefix included: %s  <-- pinned defect"
+              % sanitize_url(leaky))
+    check(sanitize_url("https://user:Hunter?pw=1&token=SECRET")
+          == "https://<redacted>",
+          "a credential-shaped authority with no host after any @ keeps "
+          "nothing of the url  <-- pinned defect")
+    check(sanitize_url("user:Hunter") == "<redacted>",
+          "and so does a bare user:word with no scheme")
+    check(sanitize_url("https://[::1]:6443/x?u=a@b.com&token=SECRET")
+          == "https://[::1]:6443/x",
+          "a bracketed IPv6 host is not mistaken for a credential")
+    check(sanitize_url("https://u:p?z@[::1]:6443/x")
+          == "https://[::1]:6443/x",
+          "and one after a credential is accepted as the host")
+    check(sanitize_url("https://h/x?time=1:2&e=a@b&token=SECRET")
+          == "https://h/x" and sanitize_url(
+              "https://h:6443/arcgis/rest?u=a@b.com&token=SECRET")
+          == "https://h:6443/arcgis/rest",
+          "the query @ cases still print only the host and path")
     for pathless in ("https://h:6443?u@x.com&token=SECRET",
                      "https://h?u@x.com&token=SECRET",
                      "https://u:p?w@h/x?u@x.com&token=SECRET",
@@ -2574,13 +2648,10 @@ def self_test():
             "items": [{"id": text, "title": text, "owner": text,
                        "type": text, "access": text}]})
     leaked = {"findings": injected}
-    probe_dir = tempfile.mkdtemp(prefix="ghostsvc-formula-")
-    try:
-        probe_csv = write_csv(leaked, os.path.join(probe_dir, "f.csv"))
-        with io.open(probe_csv, "r", encoding="utf-8", newline="") as handle:
-            probe_table = list(csv.reader(handle))
-    finally:
-        shutil.rmtree(probe_dir, ignore_errors=True)
+    probe_buffer = io.StringIO(newline="")
+    render_csv(leaked, probe_buffer)
+    probe_table = list(csv.reader(io.StringIO(probe_buffer.getvalue(),
+                                              newline="")))
     check(len(probe_table) == 1 + len(LEADS),
           "six hostile findings read back as six rows under the header, so a "
           "tab or carriage return inside a cell did not split a row")
@@ -3009,7 +3080,8 @@ def self_test():
         def __init__(self, catalog=None, services=None, folders=None,
                      org="ORG123", token="TESTTOKEN", open_error=None,
                      fail_search_after=None, anonymous=(), login_page=(),
-                     http_error=(), down=()):
+                     http_error=(), down=(), role="org_admin"):
+            self.role = role
             self.catalog = catalog
             self.services = services if services is not None else []
             self.folders = folders or {}
@@ -3075,7 +3147,10 @@ def self_test():
                                                  "password."}}
                 return {"token": self.token, "expires": 9999999999999}
             if path.endswith("/portals/self"):
-                return {"id": self.org} if self.org else {}
+                body = {"id": self.org} if self.org else {}
+                if "token" in params:
+                    body["user"] = {"role": self.role}
+                return body
             if path.endswith("/search"):
                 self.searches += 1
                 if (self.fail_search_after is not None
@@ -3430,6 +3505,45 @@ def self_test():
               in seen,
               "a deployment where every service has an item and none answers "
               "anonymously exits 0")
+        clean_items = Catalog(SITE_ITEMS[:3] + [RAIL_ITEM])
+        role_json = os.path.join(workdir, "role.json")
+        code, seen = captured(lambda: serving(
+            site(anonymous=(), catalog=clean_items, role="org_publisher"),
+            lambda: main(ARGV)))
+        check(code == 2 and "CAVEATS" in seen and "org_publisher" in seen
+              and "not a clean result" in seen,
+              "a token that is not an administrator's cannot give a clean "
+              "result, because a private item it cannot see would make a "
+              "false ghost  <-- pinned defect")
+        code, seen = captured(lambda: serving(
+            site(role="org_user"), lambda: main(ARGV)))
+        check(code == 1 and "CAVEATS" in seen and "anonymous-ghost" in seen,
+              "and the ghost list it does give carries the caveat above it")
+        code, seen = captured(lambda: serving(
+            site(role="org_user"), lambda: main(
+                ARGV + ["--out", role_json, "--apply"])))
+        with io.open(role_json, "r", encoding="utf-8") as handle:
+            role_doc = json.load(handle)
+        check(len(role_doc["caveats"]) == 1
+              and "org_user" in role_doc["caveats"][0],
+              "the caveat is in the JSON report too")
+        code, seen = captured(lambda: serving(
+            site(anonymous=(), catalog=clean_items),
+            lambda: main(ARGV)))
+        check(code == 0 and "CAVEATS" not in seen,
+              "an administrator's token carries no caveat")
+        code, seen = captured(lambda: serving(
+            site(), lambda: main(["--server", SERVER, "--portal", PORTAL,
+                                  "--query", "owner:ann"])))
+        check("CAVEATS" not in seen,
+              "and a run with no token has no role to judge")
+        check(role_caveat({}, "T").endswith("before you act.")
+              and "role is unknown" in role_caveat({}, "T")
+              and "role is unknown" in role_caveat({"user": "x"}, "T")
+              and "role is unknown" in role_caveat({"user": {"role": 5}}, "T")
+              and role_caveat({"user": {"role": "org_admin"}}, "T") is None
+              and role_caveat({}, None) is None,
+              "a missing or odd role reads as unknown, never as an admin")
         code, seen = captured(lambda: serving(
             site(anonymous=(), down=["Roads/MapServer"],
                  catalog=Catalog(SITE_ITEMS[:3] + [RAIL_ITEM])),
@@ -3818,7 +3932,7 @@ def self_test():
             path, _sep, query = self.path.partition("?")
             params = dict(urllib.parse.parse_qsl(query))
             if path.endswith("/portals/self"):
-                self._send({"id": "ORG"})
+                self._send({"id": "ORG", "user": {"role": "org_admin"}})
             elif path.endswith("/search"):
                 self._send(self.server.catalog(
                     params["q"], int(params["start"]), int(params["num"])))
@@ -3958,6 +4072,25 @@ def self_test():
     check(usage_exit(["--server", SERVER, "--unpublish"]) == 64,
           "an unknown flag is a usage error, exit 64, not argparse's 2  "
           "<-- pinned defect")
+    def usage_text(argv):
+        noise, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            _parse(argv)
+        except SystemExit:
+            pass
+        shown, sys.stderr = sys.stderr.getvalue(), noise
+        return shown
+    for number, stray in enumerate((
+            ["--password", "hunter2"], ["--tok", "hunter2"],
+            ["--tokn=hunter2"], ["-p", "hunter2"], ["hunter2"]), 1):
+        shown = usage_text(["--server", SERVER] + stray)
+        check("unrecognized arguments" in shown and "hunter2" not in shown,
+              "an unknown argument, shape %d of 5, is named without the "
+              "secret beside it in the error  <-- pinned defect" % number)
+    check("--password" in usage_text(["--password", "hunter2"])
+          and "--tokn" in usage_text(["--tokn=hunter2"])
+          and "no flag" in usage_text(["hunter2"]),
+          "the flag is still named, so the typo can be found")
     check(usage_exit(["--format", "xml"]) == 64
           and usage_exit(["--num", "x"]) == 64,
           "so are a bad --format and a non-numeric --num")
@@ -4082,6 +4215,16 @@ class _Parser(argparse.ArgumentParser):
     argparse exits 2, and 2 is this tool's code for "the server or the portal
     could not be read", so a typo in a scheduled job would read as an outage.
     """
+
+    def parse_args(self, args=None, namespace=None):
+        # argparse names every unrecognised argument, and the one after an
+        # unknown --password or --tok is the secret. Only the flag is named.
+        parsed, extras = self.parse_known_args(args, namespace)
+        if extras:
+            flags = [a.split("=", 1)[0] for a in extras if a.startswith("-")]
+            self.error("unrecognized arguments: %s"
+                       % (" ".join(flags) if flags else "a value with no flag"))
+        return parsed
 
     def error(self, message):
         self.print_usage(sys.stderr)
@@ -4248,8 +4391,11 @@ def _main(argv):
         print("%d service(s) in the catalog" % len(services))
 
         query = args.query
+        me = {}
+        if token or not query:
+            me = portal_self(args.portal, token, args.insecure)
         if not query:
-            oid = org_id(args.portal, token, args.insecure)
+            oid = me.get("id")
             if not oid:
                 raise RuntimeError("could not read the org id, pass --query")
             query = "orgid:%s" % oid
@@ -4286,6 +4432,9 @@ def _main(argv):
     report = reconcile(services, list(items.values()), anonymous, details,
                        probes, aliases)
     report.warnings.extend(warnings)
+    caveat = role_caveat(me, token)
+    if caveat:
+        report.caveats.append(caveat)
 
     print("")
     encoding = getattr(sys.stdout, "encoding", None)

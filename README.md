@@ -18,7 +18,7 @@ footer.
 
 ```
 $ python ghostsvc.py --self-test
-ghostsvc self-test: no server, no portal, no network, no token
+ghostsvc self-test: no deployment, no portal, no token, one loopback stub
 --------------------------------------------------------------------
 PASS  a plain rest url keys to host, folder-less name and type
 ...
@@ -92,11 +92,16 @@ PASS  an item on another domain with the same first label does not hide the ghos
 ...
 PASS  a probe that got no definite answer from any service exits 2, not 0  <-- pinned defect
 ...
+PASS  a token that is not an administrator's cannot give a clean result, because a private item it cannot see would make a false ghost  <-- pinned defect
+...
 PASS  a ghost whose probe could not ask is recorded as unknown, not as not anonymous  <-- pinned defect
 ...
 PASS  a user:password@ in a url does not survive sanitising  <-- pinned defect
 ...
 PASS  a password holding 'Hunter/2pw' is removed whole  <-- pinned defect
+...
+PASS  a password holding ? or # before its @ is cut whole, user name and password prefix included: https://h/x  <-- pinned defect
+PASS  a credential-shaped authority with no host after any @ keeps nothing of the url  <-- pinned defect
 ...
 PASS  an @ in a query parameter is not a credential separator, so the token after it is not printed  <-- pinned defect
 ...
@@ -161,6 +166,7 @@ PASS  an exception nothing foresaw exits 2, not 1 which means findings, and prin
 PASS  a --server with no --portal is a usage error, because every service would be a ghost  <-- pinned defect
 ...
 PASS  an unknown flag is a usage error, exit 64, not argparse's 2  <-- pinned defect
+PASS  an unknown argument, shape 1 of 5, is named without the secret beside it in the error  <-- pinned defect
 ...
 PASS  a unique prefix of the write flag is refused, because argparse would otherwise take --ap for --apply  <-- pinned defect
 ...
@@ -168,13 +174,13 @@ PASS  a plausible-looking --unpublish is refused, because this tool changes noth
 ...
 PASS  the harness records a false check, a missing exception, two wrong exceptions, an argv argparse accepted, two bad enumerations, four bad url comparisons and three bad calls as thirteen failures, so a broken tool turns this self-test red  <-- pinned defect
 --------------------------------------------------------------------
-569 assertions, 0 failed
+606 assertions, 0 failed
 ```
 
 ## Requirements
 
-Python 3.9 or newer. The final file's self-test ran green, with 569 assertions, on Windows 3.9.25, 3.10.20, 3.11.15, 3.12 and 3.13, and on Linux 3.12.3. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
-`time`, `argparse`, `datetime`, `getpass`, and `re`, `tempfile`, `shutil` and `runpy` in the self-test. It
+Python 3.9 or newer. The final file's self-test printed `606 assertions, 0 failed` on Windows 3.11.8, 3.12.10, 3.13.2 and 3.13.7, and on Linux 3.12.3. Python 3.9 and 3.10 were not run for this version, because no interpreter of those versions is installed on the machine that built it. The file parses under the 3.9 grammar (`ast.parse` with `feature_version=(3, 9)`) and uses no f-strings. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
+`time`, `argparse`, `datetime`, `getpass` and `re`, and `threading`, `http.server`, `tempfile`, `shutil` and `runpy` in the self-test. It
 runs on a plain `python3`. It was not run on ArcGIS Pro's own interpreter, which is a 3.9 build, so that is untested here. `arcpy` is not used and the `arcgis` package
 is not needed.
 
@@ -183,13 +189,14 @@ git clone https://github.com/uhsear/ghostsvc.git
 python ghostsvc.py --self-test
 ```
 
-`--self-test` needs no server, no portal, no network and no credentials. You can check the tool
+`--self-test` needs no deployment, no portal and no credentials. You can check the tool
 before you point it at a deployment. It covers the network paths as well as the decisions. The
 catalog walk, the item paging, sign-in, an expired token, an HTTP error, a 200 carrying an ArcGIS
-error envelope and the whole command line all run against a stand-in deployment. That deployment
-answers inside the process, and no socket is opened. The shipped self-test therefore never
-exercises the real `urllib` and TLS path. The CSV example below came from a separate, one-off run
-against a local `http.server`, and that stub is not part of this repository.
+error envelope and the whole command line run against a stand-in deployment that answers inside
+the process. One block of the self-test, titled "a real socket", starts a `http.server` on
+`127.0.0.1` and runs `main()` through the real `urllib` opener against it, with `--token`,
+`--apply`, `--format csv` and a `--username` sign-in. That is plain HTTP on the loopback address,
+so no TLS connection is made. The temporary files it writes come from `--apply` runs of `main()`.
 
 ## Usage
 
@@ -362,18 +369,23 @@ this tool, so they are not touched. Only the CSV is guarded. The JSON report car
 
 ```
 kind,severity,key,service_url,folder,name,type,anonymous,detail,item_id,item_title,item_owner,item_type,item_access
-anonymous-ghost,100,127.0.0.1:8831/=cmd/MapServer,http://127.0.0.1:8831/arcgis/rest/services/%3Dcmd/MapServer,,'=cmd,MapServer,yes,answered with currentVersion and no token,,,,,
-orphan,20,127.0.0.1:8831/gone/FeatureServer,http://127.0.0.1:8831/arcgis/rest/services/Gone/FeatureServer,,,,,,abc,'@evil,'+owner,Feature Service,public
+anonymous,80,127.0.0.1:61483/open/MapServer,http://127.0.0.1:61483/arcgis/rest/services/Open/MapServer,,Open,MapServer,yes,answered with currentVersion and no token,x2,'-hyper,ann,Map Service,org
+ghost,50,127.0.0.1:61483/=cmd/MapServer,http://127.0.0.1:61483/arcgis/rest/services/%3Dcmd/MapServer,,'=cmd,MapServer,no,499 Token Required,,,,,
+orphan,20,127.0.0.1:61483/gone/MapServer,http://127.0.0.1:61483/arcgis/rest/services/Gone/MapServer,,,,,,x1,'@evil,'+owner,Map Service,public
 ```
 
-That is the header and two rows of the output of a real run of `main()` over a socket against a
-local `http.server` stand-in, with a service named `=cmd` and an item titled `@evil` owned by
-`+owner`. The service url shows `%3Dcmd` because the tool percent-encodes every catalog name. The `name` column keeps the raw text and is the guarded cell. The orphan's `anonymous` cell is empty because an orphan is never probed. The stand-in
-script is not part of this repository. The self-test has one assertion for each of
-the eleven text columns, and each one tries all six characters. They are written out as a literal
-tuple in the test, so shrinking the constant in the tool turns the self-test red. The tool never reads its own CSV
-back, so there is nothing to un-prefix. If you load the file into a script, strip one leading
-apostrophe from a cell that starts with `'` followed by one of the six characters.
+That is the header and three of the four rows that `main()` wrote in one run of the self-test's
+"a real socket" block, which you can repeat with `python ghostsvc.py --self-test`. The stub there
+is a `http.server` in `ghostsvc.py`, with a service named `=cmd`, one led by a tab (its row is
+left out here), an item titled `@evil` owned by `+owner` and an item titled `-hyper`. The port
+changes on every run. The service url shows `%3Dcmd` because the tool percent-encodes every
+catalog name. The `name` column keeps the raw text and is the guarded cell. The orphan's
+`anonymous` cell is empty because an orphan is never probed. The self-test has one assertion for
+each of the eleven text columns, and each one tries all six characters. They are written out as a
+literal tuple in the test, so shrinking the constant in the tool turns the self-test red. The tool
+never reads its own CSV back, so there is nothing to un-prefix and no round trip to pin. If you
+load the file into a script, strip one leading apostrophe from a cell that starts with `'`
+followed by one of the six characters.
 
 ## Exit codes
 
@@ -381,7 +393,7 @@ apostrophe from a cell that starts with `'` followed by one of the six character
 |---|---|
 | 0 | Every service has a portal item and none answered without a token. Also: `--no-probe` was given and there is no ghost or orphan. That second case says anonymity was not tested, so read the exit code as an answer about ghosts and orphans only. |
 | 1 | There are findings to review. A finding wins over an unanswered probe. |
-| 2 | The server or the portal could not be read, so no list is given. Also: the report file could not be written, there is no finding and at least one service could not be probed, there is no finding and the enumeration warned, the password could not be asked for, or an exception the tool did not foresee ended the run. |
+| 2 | The server or the portal could not be read, so no list is given. Also: the report file could not be written, there is no finding and at least one service could not be probed, there is no finding and the enumeration warned, there is no finding and the token is not an organization administrator's (see Limits), the password could not be asked for, or an exception the tool did not foresee ended the run. |
 | 64 | Usage error, including an unknown flag or a bad value. |
 
 ## Limits
@@ -432,12 +444,16 @@ apostrophe from a cell that starts with `'` followed by one of the six character
   character in published text reaches the console.
 - A token or password inside the url you pass as `--server` or `--portal`, or inside an item's url,
   is dropped before anything is requested, printed or written, including the `referer` posted to
-  `generateToken`. The credential is cut at the last `@`, so a password that holds `/`, `?` or `#`
-  goes too. It never authenticates, so use a token. An `@` that follows a `?` or `#` is a query parameter, such as `?e=a@b.com` or `?u@x.com&token=T`, not a credential separator, when a `/` came before the `?` or a `=` or `&` sits between them, so the
-  query is dropped whole and the token in it goes too. A password that holds `?` and then a `=` or
-  `&` before its `@` is read as a query and keeps its first part. An `@` in the path of a url that
-  has a port, such as `host:6443/svc@x`, is read as a credential separator and the host is cut off,
-  so that item reads as unreadable or as a false orphan. Esri service names rarely hold an `@`.
+  `generateToken`. The authority ends at the first `/`, `?` or `#`, and an `@` inside it ends the
+  credential. A query or path `@`, such as `?e=a@b.com`, is never a credential end, so the query is
+  dropped whole and the token in it goes too. A password that itself holds `/`, `?` or `#` makes the
+  text before that character look like `user:part`, because a host port is digits only. The tool then
+  keeps the host after the last `@` that is followed by a host name or address, or keeps nothing and
+  prints `<redacted>` when none is. A password that is one to five digits up to its first `/`, `?` or
+  `#` looks like a port and is kept, because `host:6443/x?u=a@b.com` is the common shape and the two
+  cannot be told apart. It never authenticates, so use a token.
+- A token passed as a path parameter (`;token=...`) rather than a query string is not removed from
+  item urls.
 - A password that the server echoes back in an error is removed in its plain, form-encoded and
   percent-encoded spellings. Any other encoding is not recognised.
 - A server that answers with an HTTP redirect to another host gets the token, because `urllib`
@@ -457,20 +473,22 @@ apostrophe from a cell that starts with `'` followed by one of the six character
   may list. An empty catalog next to an empty portal exits 0 and prints the sentence that every
   service has an item, which is vacuous for zero services.
 - The item side comes from `search`, and Esri says "The results of a search only contain items that
-  the user has permission to access". A run with a token that cannot see an item reports that
-  item's service as a ghost, although the item exists. Run with a token that sees every item, such
-  as an administrator's, before you act on a ghost.
-- `--self-test` makes a temporary directory and a temporary CSV outside `--apply`, and removes them
-  afterwards. Nothing else the tool does writes without `--apply`.
-- The shipped self-test drives the network code through an in-process stand-in, not a socket. The
-  real HTTP path was checked by hand against a local `http.server`: a full run with `--token`
-  and a `--username` sign-in whose posted `referer` carried no credential. That stand-in is not in
-  this repository. The end-to-end runs in the self-test do not cover `generateToken` over a socket,
-  `--admin`, `--insecure`, the date bisect or the 10,000 refusal.
+  the user has permission to access". A token that is not an organization administrator's can miss
+  an item that is private to another user, and its service then reads as a ghost although the item
+  exists. The tool reads `user.role` from `portals/self` (Esri lists `org_admin`, `org_publisher`
+  and `org_user`). When the role is anything but `org_admin`, or is missing, the output and the JSON
+  `caveats` list say so, and a run with no finding exits 2 instead of 0. The tool cannot know what an
+  administrator's search returns beyond the sentence above, so look at a ghost from an
+  administrator's token before you act on it. A run with no token has no role to
+  judge and carries no caveat.
+- `--self-test` makes temporary directories for its `--apply` runs and removes them afterwards. It
+  renders the formula-guard CSV into memory. No data run writes without `--apply`.
+- Most of the self-test drives the network code through an in-process stand-in, and one block runs
+  `main()` over a loopback socket in plain HTTP. No TLS connection is made. The date bisect, the
+  10,000 refusal, `--admin` and `--insecure` run only against the in-process stand-in.
 - These three Esri behaviours rest on observation and are not cited to an Esri page: the HTTP 200
   with error 499 `Token Required`, the default ports 80, 443, 6080 and 6443, and whether
   `/rest/services` lists a stopped service.
-- The socket-level CSV example came from a stub that is not shipped, so the shipped self-test uses an in-process stand-in.
 - The tool does not read its CSV back, so consumers must strip one leading apostrophe themselves.
 - A zero-service server with a portal that holds no service items exits 0 and says the probe was not run, although it ran. A wrong `--server` that answers an empty listing looks the same as a clean org.
 - An error line printed to stderr is not re-encoded. A portal message with characters outside the console code page can turn into `unexpected UnicodeEncodeError` on a redirected Windows console. The exit code stays correct.
@@ -494,22 +512,36 @@ apostrophe from a cell that starts with `'` followed by one of the six character
   with `error: unexpected UnicodeEncodeError` and exit 2, and the report file is cut short.
 - `--out` truncates an existing file before it writes, so a write that fails destroys the previous
   report. Keep the last one under another name.
-- The CSV carries neither the warnings nor the count of unreadable items. They are in the JSON and
+- The CSV carries neither the warnings, the caveats nor the count of unreadable items. They are in the JSON and
   on the console, so a CSV from a run that exited 2 on warnings looks complete.
 - A cell is guarded by its first character. A text such as the item title `-5` becomes the text
   `'-5`, never a number. Only `severity` stays numeric. A leading line feed, a full-width `=`, `+`,
   `-` or `@`, and a formula character after a space, are not guarded.
 - A service type that is not in the tool's list of ArcGIS service types stops the run with exit 2,
   because the key cannot be built. That is a refusal, not a guess. Add the type to `SERVICE_TYPES`.
-- The self-test parses `--admin` and `--insecure` and runs the admin catalog call and an
-  `insecure` call against the in-process stand-in. It makes no TLS connection and runs no whole
-  `--admin` run, so those two are not exercised end to end. A one-off run of `--token`, `--apply`
-  and `--format csv` over a socket against a local `http.server` produced the CSV example above.
-  That stub is not in this repository, so you cannot repeat that run from it.
-- Coverage is 100 percent of branches on Windows 3.13, 1875 statements and 376 branches, with no
-  line left out. Linux was run without the coverage module, so the Linux run proves the assertions
-  and not the percentage. The Windows 3.9, 3.10, 3.11, 3.12 and 3.13 runs and the Linux 3.12 run print the same
-  assertion count, 569, because the self-test does not branch on the host.
+- Coverage is 100 percent of statements and branches on Windows 3.13.2, 2020 statements and 414
+  branches, with no line left out (`python -m coverage run --branch ghostsvc.py --self-test`, then
+  `python -m coverage report -m`). Linux was run without the coverage module, so the Linux run proves
+  the assertions and not the percentage. The Windows 3.11.8, 3.12.10, 3.13.2 and 3.13.7 runs and the
+  Linux 3.12.3 run all print 606 assertions, because the self-test does not branch on the host.
+
+- A source text that already begins with an apostrophe followed by a formula character is left
+  unchanged, so a consumer that strips one apostrophe will alter it.
+- Items that point at other hosts, such as Esri-hosted basemaps or hosted services of another ArcGIS
+  Online organization, are reported as ORPHAN findings with severity 20, which is noisy on a typical
+  Enterprise portal.
+- The end of the search results is taken from `nextStart` equal to -1. The cited search page states
+  `num` up to 100, the top 10,000 results and the permission sentence, but does not state that
+  end marker, so it rests on observation.
+- `GHOSTSVC_TOKEN` is used before `--username`, so when both are set the password is never read and
+  no warning is printed.
+- A failed `--self-test` exits 1, the same code a data run uses for findings, so do not schedule
+  `--self-test` beside a data run under one exit-code check.
+- `urllib` uses the proxy named by `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, so the token in the
+  query string is visible to that proxy.
+- An unknown flag is named in the usage error without the value after it. `argparse` still quotes
+  the value of a known flag it cannot parse, such as `--num` or `--format`, so do not put a secret
+  there.
 
 ## Sources
 
@@ -523,7 +555,8 @@ apostrophe from a cell that starts with `'` followed by one of the six character
 - `generateToken` is a POST to `/sharing/rest/generateToken` taking `username`, `password`,
   `client`, `referer` and `expiration`:
   https://developers.arcgis.com/rest/users-groups-and-items/generate-token/
-- `portals/self` returns the organization `id`:
+- `portals/self` returns the organization `id`, and with a token a `user` object whose `role` is
+  `org_admin`, `org_publisher` or `org_user`; a request without a token has no `user`:
   https://developers.arcgis.com/rest/users-groups-and-items/portal-self/
 - The admin services listing carries `folderName` and `serviceName`:
   https://developers.arcgis.com/rest/enterprise-administration/server/services/
