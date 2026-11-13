@@ -208,6 +208,10 @@ def _host_after_at(text, strict):
     return False
 
 
+# The path between a host:port and a later @: letters, digits and . _ ~ - only,
+# as in /arcgis/rest/services/Parcels, so the @ after it is a path word.
+_PLAIN_PATH = re.compile(r"(/[A-Za-z0-9._~-]*)+$")
+
 # A service path after the catalog marker, in a url too odd to key.
 _CATALOG_PATH = re.compile(r"/(rest|admin)/services/[^/]", re.IGNORECASE)
 
@@ -275,6 +279,29 @@ def sanitize_url(url):
     if (has_password and after_head[:1] in ("?", "#")
             and _host_after_at(after_head[1:], not has_at)):
         return scheme + sep + "<redacted>"
+    # Structural rule, after the ambiguous ? and # cases above: the credential ends at the last @ before the first
+    # ? or # (the last @ of the whole url when there is neither), whenever a :
+    # lies before it. Text from before that @ is never printed, and when what
+    # follows is not a host nothing of the url is kept. A bare host:port with an
+    # @ deep in its path (Parcels@2024) is not a credential and skips this rule.
+    query_at = re.search("[?#]", rest)
+    scope = rest[:query_at.start()] if query_at else rest
+    last_at = scope.rfind("@")
+    bare_port = "@" not in head and (
+        ":" not in head or (re.fullmatch(r"\d{1,5}", head.rpartition(":")[2])
+                            and _PLAIN_PATH.match(scope[len(head):last_at])))
+    if last_at >= 0 and ":" in scope[:last_at] and not bare_port:
+        tail = rest[last_at + 1:]
+        stop = re.match("([^/?#]*)(.?)", tail)
+        # An @ after the first / belongs to a password that held a /, so there
+        # the host must be followed by / or ?, as the paths below demand.
+        if not _AUTH_TAIL.match(stop.group(1)) or (
+                last_at > len(head) and stop.group(2) not in ("/", "?")
+                and not re.fullmatch(r"\d{1,5}", head.rpartition(":")[2])):
+            return scheme + sep + "<redacted>"
+        rest = tail.split("#", 1)[0].split("?", 1)[0]
+        authority, slash, path = rest.partition("/")
+        return scheme + sep + authority + slash + path.split(";", 1)[0]
     if "@" in head:
         # A password that holds an @ and then a / puts the real host after a
         # later @ in the path, so the path is searched for a host-shaped tail.
@@ -1698,6 +1725,7 @@ def _make_parent(path):
 def self_test():
     """Assertions over the reconcile core. No deployment, no real token; the
     network path runs against one loopback stub."""
+    import random
     import shutil
     import tempfile
 
@@ -2707,8 +2735,9 @@ def self_test():
     check(sanitize_url("https://user@gis.example.org/arcgis")
           == "https://gis.example.org/arcgis",
           "a user name with no password is removed too")
-    check(sanitize_url("https://u:p@h/a@h2/b@!") == "https://h2/b@!",
-          "the path search skips an @ whose tail is not a host name")
+    check(sanitize_url("https://u:p@h/a@h2/b@!") == "https://<redacted>",
+          "the last @ ends the credential, and a tail that is no host keeps "
+          "nothing of the url  <-- pinned defect")
     check(sanitize_url("gis.example.org/a?next=https://x/y")
           == "gis.example.org/a",
           "a :// inside a query string is not taken for a scheme")
@@ -2743,6 +2772,36 @@ def self_test():
               "<-- pinned defect" % sanitize_url(ambiguous))
     check(sanitize_url("https://u:PW@h/x?e=a@b&token=SECRET") == "https://h/x",
           "a real user:password@ is still removed beside a query @")
+    for tail_leak, want in (
+            ("https://u:a/b@h/c@host", "https://<redacted>"),
+            ("https://u:a/b@h/c@host:6443", "https://<redacted>"),
+            ("https://u:a/b@h/c@host#frag", "https://<redacted>"),
+            ("https://u:a/b@h/c@host/p?q=1", "https://host/p"),
+            ("https://u:a/b@h/c@2024", "https://<redacted>")):
+        check(sanitize_url(tail_leak) == want,
+              "a password holding / and @ is cut at the last @ before any ? "
+              "or #, so no tail of it is printed: %s  <-- pinned defect"
+              % sanitize_url(tail_leak))
+    leak_rng = random.Random(20261113)
+    leak_pw = "/@:%0123456789abcxyz"
+    leak_hosts = ("host", "a.b.example.org", "10.1.2.3", "[::1]", "h",
+                  "h:6443", "[::1]:80", "10.0.0.5:8443", "x/y", "2024",
+                  "h%2F", "1.2")
+    leaked = 0
+    for _ in range(3000):
+        word = "".join(leak_rng.choice(leak_pw)
+                       for _ in range(leak_rng.randint(0, 6)))
+        word += "ZQMARK" + "".join(leak_rng.choice(leak_pw)
+                                   for _ in range(leak_rng.randint(0, 6)))
+        fuzz_url = "%s://%s:%s@%s%s%s" % (
+            leak_rng.choice(("https", "http")), leak_rng.choice(("u", "svc")),
+            word, leak_rng.choice(leak_hosts),
+            leak_rng.choice(("", "/p", "/p@q", "/a@h2/b")),
+            leak_rng.choice(("", "#f", "?q=1", "?e=a@b.com#f")))
+        if "ZQMARK" in sanitize_url(fuzz_url):
+            leaked += 1
+    check(leaked == 0, "a seeded fuzz of 3000 urls with a marker in the "
+          "password prints the marker %d times  <-- pinned defect" % leaked)
     check(sanitize_url("https://h:6443/x#f=1@2&token=SECRET")
           == "https://h:6443/x",
           "an @ in a fragment is read the same way  <-- pinned defect")
@@ -2816,9 +2875,8 @@ def self_test():
               "credential, so neither a token nor an e-mail domain becomes "
               "the host: %s  <-- pinned defect" % sanitize_url(tailed))
     check(sanitize_url("https://u:p/x@h.example.com/a?e=a@b.com/foo")
-          == "https://b.com/foo",
-          "the known limit: a query @ with a host and a / after it is still "
-          "read as the credential end, which the Limits name")
+          == "https://h.example.com/a",
+          "a query @ with a host and a / after it is not the credential end")
     check(sanitize_url("https://u:p/x@Zq9XkTok") == "https://<redacted>"
           and sanitize_url("https://u:p/x?e=a@Zq9XkTok") == "https://<redacted>",
           "and with no host that a path follows nothing of the url is kept  "
