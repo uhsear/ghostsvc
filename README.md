@@ -190,14 +190,14 @@ PASS  a plausible-looking --unpublish is refused, because this tool changes noth
 PASS  the harness records a false check, a missing exception, a wrong exception, an argv argparse accepted, two bad enumerations, four bad url comparisons and three bad calls as thirteen failures, so a broken tool turns this self-test red  <-- pinned defect
 ...
 --------------------------------------------------------------------
-646 assertions, 0 failed
+665 assertions, 0 failed
 ```
 
 ## Requirements
 
-Python 3.9 or newer. The final file's self-test printed `646 assertions, 0 failed` on Windows 3.9.25, 3.10.20, 3.11.15, 3.12.10 and 3.13.2, and on Linux 3.12.3 (run on the festie host with `python3 -W error`). The file parses under the 3.9 grammar (`ast.parse` with `feature_version=(3, 9)`) and uses no f-strings. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
+Python 3.9 or newer. The final file's self-test printed `665 assertions, 0 failed` on Windows 3.9.25, 3.10.20, 3.12.10 and 3.13.2, and on Linux 3.12.3 (run on the festie host with `python3 -W error`). The file parses under the 3.9 grammar (`ast.parse` with `feature_version=(3, 9)`) and uses no f-strings. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
 `argparse`, `datetime`, `getpass` and `re`, and `threading`, `http.server`, `tempfile`, `shutil` and `runpy` in the self-test. It
-runs on a plain `python3`. It was not run on ArcGIS Pro's own interpreter, which is a 3.9 build, so that is untested here. `arcpy` is not used and the `arcgis` package
+runs on a plain `python3`. It was not run on ArcGIS Pro's own interpreter, so that is untested here. `arcpy` is not used and the `arcgis` package
 is not needed.
 
 ```
@@ -256,7 +256,7 @@ python ghostsvc.py --server https://gis.example.com/arcgis \
 There is no `--password` flag, and there never will be. `argv` is readable by every process on the
 machine, and it lands in shell history and in scheduler logs. The password comes from
 `GHOSTSVC_PASSWORD` or from an unechoed prompt. A token has the same exposure, so it can come
-from `GHOSTSVC_TOKEN` as well as from `--token`. No report holds either, as long as it travels in the query string. A `;token=` path parameter is not removed (see Limits). Every error message is
+from `GHOSTSVC_TOKEN` as well as from `--token`. No report holds either, as long as it travels in the query string. A `;name=value` path parameter is dropped too. Every error message is
 stripped of it before it is printed, because `generateToken` is a POST and urllib repeats the
 request in some of its exceptions. The token gets the same treatment. A token travels as a query
 parameter, and urllib answers a url it cannot open by quoting that whole url back.
@@ -478,12 +478,19 @@ followed by one of the six characters.
   prints `<redacted>` when none is. A password of one to five digits and then a `/`, such as
   `https://admin:12/34@host/x`, is cut like any other, because an `@` in the path after `host:port`
   is read as the credential end. An `@` whose tail is only digits (`Parcels@2024`) is not. A password of
-  one to five digits and then a `?` or `#` looks like a port followed by a query and is kept,
-  because `host:6443/x?u=a@b.com` is the common shape and the two cannot be told apart. It never
-  authenticates, so use a token.
-- A token passed as a path parameter (`;token=...`) rather than a query string is not removed from
-  item urls, `--server` or `--portal`, so the first claim above covers the query string, the
-  fragment and the user and password only.
+  one to five digits and then a `?` or `#`, such as `https://u:12?pw@host/x`, looks like a port followed by a
+  query. When it has no path and an `@` then a host name and a `/` or `?` follow, the tool keeps nothing
+  of the url and prints `<redacted>`. A `user:password@` that a `?` or `#` and a later `@` follow, with no
+  path before them, is treated the same way, so `https://u:p@ss?w@host/x` prints `<redacted>` and not `ss`.
+  The common shape `host:6443/x?u=a@b.com` has a path and is kept. A url such as
+  `https://host:6443?u=a@b.com&f=json`, a port followed straight by a query e-mail and a `&`, is kept too.
+  A one-off fuzz run of 224,149 urls whose passwords held letters, digits and `@` but no `/`, `?` or `#`
+  printed no part of any password. The run is not in the self-test.
+  A password that holds two of `/`, `?` and `#`, or starts with one of them, can still leave a tail: `https://u:-?@Y?@host`
+  prints `https://Y`. Use a token, or percent-encode the password.
+- A path parameter such as `;token=...` or `;jsessionid=...` is dropped from every url, with all that follows
+  it in the path. The tool relies on ArcGIS service paths never holding a semicolon. A token that sits
+  anywhere else in a path, for example `/tokens/<value>/`, is not recognised.
 - A password that the server echoes back in an error is removed in its plain, form-encoded and
   percent-encoded spellings. Any other encoding is not recognised.
 - The token goes to the host named in `--server` and `--portal`, in the query string of every request.
@@ -531,8 +538,6 @@ followed by one of the six characters.
 - These two Esri behaviours rest on observation and are not cited to an Esri page: the HTTP 200
   with error 499 `Token Required`, and whether `/rest/services` lists a stopped service. Ports 80
   and 443 are the plain HTTP and HTTPS defaults. Ports 6080 and 6443 are cited under Sources.
-- A token in a `;token=` path parameter of a portal item url is not removed, so it lands in the JSON
-  `unreadable_items[].url` when that item url cannot be keyed.
 - `--format csv` or `--format json` without `--out` is ignored without a warning, and nothing is written.
 - An item url that looks like a service but cannot be keyed, such as `.../rest/services/Roads/MapServer/export`,
   is counted under could not read and is not reconciled, so a deleted service behind it is not reported as an
@@ -551,14 +556,13 @@ followed by one of the six characters.
 - A catalog entry whose type is not in `SERVICE_TYPES` ends the whole run with exit 2 instead of skipping that
   service. After a new Enterprise release adds a service type, that is the likeliest cause of an exit 2 with
   no other explanation.
-- `service_key()` does not call `sanitize_url()`. For an item url with a password that holds `@` and then `/`
-  (for example `https://ann:x@y@zed/q@host/...`), the key can be a fragment such as `zed/roads/MapServer`,
-  and that fragment is written to the `key` column of the JSON and the CSV. The url columns are cut as usual.
+- `service_key()` reads the sanitised url, so the `key` column and the text of an unkeyable-url refusal
+  hold no part of a password. The key of a url that was cut to `<redacted>` is refused, which counts that
+  item as unreadable.
 - `--portal` or `--server` over plain `http://` sends the token in every query string, and the `--username`
   password in clear text.
-- A password of one to five digits and then a `?`, such as `user:12?Hunter@host`, prints `user:12`. The two
-  digits look like a port, and the shortcut is named in the code.
-- `LICENSE` has CRLF line endings and the other three files have LF. This is a style point only.
+- Every committed file uses LF line endings. Git with `core.autocrlf` set to `true`, the default on Windows,
+  writes `LICENSE` and `.gitignore` with CRLF into the working copy. The tool does not read either file.
 - A catalog that lists no service exits 2 and says so, because a wrong `--server` and a token that can list nothing give the same empty answer as a server with no service. A portal item beside an empty catalog is still an orphan, exit 1.
 - An error line printed to stderr is not re-encoded. Python writes stderr with a replacement for a character the console cannot hold, so a portal message with such a character does not end the run in an encoding error, and the exit code stays 2.
 - A token or password given in `--server` is cut from the output, but `--token` itself stays on the command line. A scheduled job should use `GHOSTSVC_TOKEN` only.
@@ -599,15 +603,14 @@ followed by one of the six characters.
   `-` or `@`, and a formula character after a space, are not guarded.
 - A service type that is not in the tool's list of ArcGIS service types stops the run with exit 2,
   because the key cannot be built. That is a refusal, not a guess. Add the type to `SERVICE_TYPES`.
-- Coverage is 100 percent of statements and branches on Windows 3.13.2, 2117 statements and 444
+- Coverage is 100 percent of statements and branches on Windows 3.13.2, 2154 statements and 460
   branches, with no line left out (`python -m coverage run --branch ghostsvc.py --self-test`, then
   `python -m coverage report -m`). Linux was run without the coverage module, so the Linux run proves
-  the assertions and not the percentage. The Windows 3.9.25, 3.10.20, 3.11.15, 3.12.10 and 3.13.2 runs and the
-  Linux 3.12.3 run all print 646 assertions, because the self-test does not branch on the host.
+  the assertions and not the percentage. The Windows 3.9.25, 3.10.20, 3.12.10 and 3.13.2 runs and the
+  Linux 3.12.3 run all print 665 assertions, because the self-test does not branch on the host.
 
 - The CSV excerpt above was captured from the real-socket block with a one-off script. The self-test asserts the same cells but does not print them.
-- A token carried as a `;token=` path parameter in `--server`, `--portal` or an item url is kept in the output. Only the query, the fragment and the user and password are cut.
-- A password that holds an `@` and then a `/` is cut whole, by searching the path for a host-shaped tail after a later `@`. A password that holds an `@` and then a `?` or `#` cannot be told from an e-mail address in the query, so the text after that `@` can reach the output. With a user and password in the url, an `@` in the path is read as the credential end.
+- A password that holds an `@` and then a `/` is cut whole, by searching the path for a host-shaped tail after a later `@`. With a user and password in the url, an `@` in the path is read as the credential end.
 - A 401 or 403 from a gateway in front of the server is read as the service refusing, so a firewall that blocks this tool reads as a clean probe.
 - An HTML page returned with status 200 is treated as a login page, so a proxy error page served as 200 reads as a refusal.
 - A source text that already begins with an apostrophe followed by a formula character is left
@@ -627,6 +630,21 @@ followed by one of the six characters.
 - An unknown flag is named in the usage error without the value after it. `argparse` still quotes
   the value of a known flag it cannot parse, such as `--num` or `--format`, so do not put a secret
   there.
+- A cell with leading whitespace before a formula character is not guarded. Whether Excel evaluates such a cell was not checked.
+- The redirect claim above rests on a stub that was run by hand. No self-test assertion pins it.
+- A `--no-probe` run that finds no ghost or orphan exits 0 and writes a CSV with no rows, which looks like the file of a probed clean run. Keep the console text, or the `unprobed` count in the JSON, with the file.
+- A `--server` or `--portal` value with a mistyped scheme, such as `https//host`, is refused and its text is not printed when it holds an `@`. Any other refused value is printed after the url cut.
+- A `--format csv` or `--format json` run without `--out` writes nothing and says nothing about the format.
+- A 200 answer that is empty, plain text or a JSON value that is not an object is read as a refusal, so a gateway that blanks the body hides an open service.
+- Services that differ only by case in folder or name are keyed as one and share one probe result.
+- Whether the admin catalog lists a service that has Feature Access as both `MapServer` and `FeatureServer` is not confirmed. If it does not, an item that points at `FeatureServer` reads as an orphan beside a ghost `MapServer`.
+- Do not pipe the console output into `head` or another reader that closes early. The run ends with a non-zero exit, and `--apply` may not have written the report.
+- If `HTTP_PROXY` or `http_proxy` is set, the self-test's loopback block goes through the proxy and fails, so set `NO_PROXY=127.0.0.1` before `--self-test`. A data run also goes through the proxy, so the anonymous probe is made from the proxy's side.
+- Ctrl+C ends the run with a Python traceback and not with one of the exit codes above.
+- Run it only under Python 3.9 or newer. It was not run on an older interpreter.
+- A run of the self-test that fails or crashes can leave `ghostsvc-selftest-*` directories in the temp folder. A green run left none behind.
+- The sample under "What it reports" is illustrative. It was not captured from a run, and no assertion pins its exact text.
+- The Esri quotes about the System and Utilities folders are not linked under Sources.
 
 ## Sources
 

@@ -28,8 +28,9 @@ the only thing it writes is a report file, which needs --apply. (--self-test
 also makes a temporary directory and removes it again.)
 
     python ghostsvc.py --self-test
+    export GHOSTSVC_TOKEN='...'
     python ghostsvc.py --server https://gis.example.com/arcgis \\
-        --portal https://portal.example.com/portal --token TOKEN
+        --portal https://portal.example.com/portal
     python ghostsvc.py --server https://gis.example.com/arcgis \\
         --portal https://portal.example.com/portal --username demo_publisher \\
         --out ghosts.csv --format csv --apply
@@ -187,6 +188,25 @@ def _host_then_path(tail):
         found.group(1)) is not None
 
 
+def _host_after_at(text, strict):
+    """True when an @ in text is followed by a host name or address.
+
+    Used only where the url has no path and a user and password, or a
+    host:digits that may be one, is followed straight by a ? or #. There a
+    query e-mail and the end of a password that holds ? cannot be told apart,
+    so the caller keeps nothing of the url. A user and password is certain, so
+    any follower counts. A bare host:digits may be a real host with a query
+    e-mail, so there (strict) a follower that a & ends is a query value and
+    does not count.
+    """
+    for found in re.finditer("@", text):
+        follower = re.match("([^/?#&]*)(.?)", text[found.end():])
+        if _AUTH_TAIL.match(follower.group(1)) and not (
+                strict and follower.group(2) == "&"):
+            return True
+    return False
+
+
 # A service path after the catalog marker, in a url too odd to key.
 _CATALOG_PATH = re.compile(r"/(rest|admin)/services/[^/]", re.IGNORECASE)
 
@@ -229,6 +249,8 @@ def sanitize_url(url):
     if not scheme.isalnum():
         # No scheme: a "://" inside a query string is not one.
         scheme, sep, rest = "", "", raw
+        if raw.startswith("//"):
+            sep, rest = "//", raw[2:]
     # RFC 3986 ends the authority at the first / ? or #. An @ inside it is the
     # end of the user:password, so the cut is at the last one. A query or path
     # @ lies after that first delimiter and is never a credential end.
@@ -244,6 +266,14 @@ def sanitize_url(url):
     # told apart. Digits and then a / are told apart: ArcGIS service paths
     # never hold an @, so an @ in the path after host:port is a credential end.
     head = re.split("[/?#]", rest, maxsplit=1)[0]
+    after_head = rest[len(head):]
+    userinfo, has_at, _host = head.rpartition("@")
+    has_password = ":" in userinfo if has_at else (
+        not head.startswith("[") and ":" in head
+        and re.fullmatch(r"\d{1,5}", head.rpartition(":")[2]) is not None)
+    if (has_password and after_head[:1] in ("?", "#")
+            and _host_after_at(after_head[1:], not has_at)):
+        return scheme + sep + "<redacted>"
     if "@" in head:
         # A password that holds an @ and then a / puts the real host after a
         # later @ in the path, so the path is searched for a host-shaped tail.
@@ -267,7 +297,8 @@ def sanitize_url(url):
             zone = rest
         base = len(head) if portlike else 0
         at = zone.rfind("@")
-        while at >= 0 and not _host_then_path(zone[at + 1:]):
+        while at >= 0 and not _host_then_path(
+                zone[at + 1:] + ("/" if portlike else "")):
             at = zone.rfind("@", 0, at)
         if at >= 0:
             rest = rest[base + at + 1:]
@@ -276,6 +307,9 @@ def sanitize_url(url):
     rest = rest.split("#", 1)[0]
     rest = rest.split("?", 1)[0]
     authority, slash, path = rest.partition("/")
+    # A ;name=value path parameter (;token=, ;jsessionid=) is dropped with all
+    # that follows it. ArcGIS service paths never hold a semicolon.
+    path = path.split(";", 1)[0]
     return scheme + sep + authority.rpartition("@")[2] + slash + path
 
 
@@ -361,7 +395,7 @@ def service_key(url):
     ghost that does not exist, or an item that never matches the service it
     actually points at.
     """
-    raw = ("%s" % (url or "")).strip()
+    raw = sanitize_url(("%s" % (url or "")).strip())
     if not raw:
         raise ValueError("an empty url names no service")
     # A url with no scheme is common in portal item records typed by hand.
@@ -1016,7 +1050,8 @@ class Report(object):
     @property
     def probe_skipped(self):
         # With no service there is nothing to probe, and that is not a skip.
-        return bool(self.services) and self.probes is not None             and not self.probes
+        return (bool(self.services) and self.probes is not None
+                and not self.probes)
 
     @property
     def probe_failed(self):
@@ -1111,7 +1146,7 @@ def reconcile(services, items, anonymous=(), details=None, probes=None,
 
 
 def build_report(server, portal, query, taken, report):
-    """Assemble the report document. No credential ever enters it."""
+    """Assemble the report document. The urls in it go through sanitize_url."""
     return {
         "ghostsvc": 1,
         "server": sanitize_url(server),
@@ -1898,7 +1933,10 @@ def self_test():
            "an empty host that matches nothing  <-- pinned defect")
     raises(lambda: service_key("https://gis.example.org:notaport/arcgis/rest/"
                                "services/Roads/MapServer"),
-           "a port that is not a number is refused with the url in the error")
+           "a port that is not a number is refused")
+    raises(lambda: service_key("https://gis.example.org:70000/arcgis/rest/"
+                               "services/Roads/MapServer"),
+           "a port outside 0 to 65535 is refused")
     raises(lambda: service_key(REST + "/Roads/MapServer/0/query"),
            "a query endpoint under a service is refused, because it is not "
            "the service the catalog lists")
@@ -2640,6 +2678,9 @@ def self_test():
     check(sanitize_url("svc:PW@gis.example.org/arcgis")
           == "gis.example.org/arcgis",
           "and neither does one on a url typed without its scheme")
+    check(sanitize_url("//svc:PW@gis.example.org/arcgis")
+          == "//gis.example.org/arcgis",
+          "or one on a scheme-relative url  <-- pinned defect")
     check(sanitize_url("https://gis.example.org/a@b/x")
           == "https://gis.example.org/a@b/x" and sanitize_url("") == "",
           "an @ in the path is left alone, and an empty url stays empty")
@@ -2762,6 +2803,64 @@ def self_test():
     check(sanitize_url("https://u:p/x@Zq9XkTok") == "https://<redacted>"
           and sanitize_url("https://u:p/x?e=a@Zq9XkTok") == "https://<redacted>",
           "and with no host that a path follows nothing of the url is kept  "
+          "<-- pinned defect")
+    svc_path = "/arcgis/rest/services/Roads/MapServer"
+    for digit_pw in ("https://svcuser:12?Hunter@gis.example.com" + svc_path,
+                     "https://svcuser:12345?x@gis.example.com" + svc_path,
+                     "https://svcuser:345#Hunter@gis.example.com" + svc_path,
+                     "https://svcuser:12?a@Hunter@gis.example.com" + svc_path):
+        check(sanitize_url(digit_pw) == "https://<redacted>",
+              "a password of digits and then a ? or # that a host follows "
+              "keeps nothing of the url: %s  <-- pinned defect"
+              % sanitize_url(digit_pw))
+    for at_pw in ("https://svcuser:p@ss?word@gis.example.com" + svc_path,
+                  "https://svcuser:p@ss#word@gis.example.com" + svc_path,
+                  "https://svcuser:p@ss?word@gis.example.com",
+                  "https://svcuser:pw@gis.example.com?e=a@b.com"):
+        check(sanitize_url(at_pw) == "https://<redacted>",
+              "a user:password@ then ? or # and another @ keeps nothing of "
+              "the url, so no tail of the password prints: %s  "
+              "<-- pinned defect" % sanitize_url(at_pw))
+    check(sanitize_url("https://svcuser:pw@gis.example.com?f=json")
+          == "https://gis.example.com"
+          and sanitize_url("https://h:6443?u=a@b.com&f=json")
+          == "https://h:6443",
+          "a ? with no @ after it, or a query e-mail that a & follows, keeps "
+          "the host as before")
+    check(sanitize_url("https://admin:12/34@host.example.com")
+          == "https://host.example.com"
+          and sanitize_url("https://admin:12/34@host.example.com/x")
+          == "https://host.example.com/x",
+          "a digit password holding / is cut whole when the host ends the "
+          "url  <-- pinned defect")
+    for param in (svc_path + ";token=PATHSECRET999",
+                  svc_path + ";jsessionid=PATHSECRET999/0",
+                  svc_path + ";token=PATHSECRET999?f=json#top"):
+        check(sanitize_url("https://gis.example.com" + param)
+              == "https://gis.example.com" + svc_path,
+              "a ;name=value path parameter is dropped with all after it: "
+              "%s  <-- pinned defect" % sanitize_url(param))
+    hidden = item_record({"id": "x", "url": "https://gis.example.com"
+                          + svc_path + ";token=PATHSECRET999"})
+    check("PATHSECRET999" not in hidden["url"]
+          and keyed(hidden["url"]) == "gis/roads/MapServer",
+          "an item url with a ;token= parameter is stored without it and "
+          "still keys as its service, so it is not a ghost  "
+          "<-- pinned defect")
+    check(service_key("https://svcuser:p@ss/word@gis.example.com" + svc_path)
+          == "gis/roads/MapServer",
+          "service_key reads the sanitised url, so no part of a password is "
+          "the key  <-- pinned defect")
+    refusals = []
+    for secret_url in ("https://svcuser:12?Hunter@gis.example.com" + svc_path,
+                       "https://svcuser:SECRETPW@gis.example.com/x"):
+        try:
+            service_key(secret_url)
+        except ValueError as exc:
+            refusals.append(str(exc))
+    check(len(refusals) == 2 and not any(
+        "Hunter" in text or "SECRETPW" in text for text in refusals),
+          "the refusal for an unkeyable url does not echo its password  "
           "<-- pinned defect")
     check(item_record({"id": "x", "url": "https://u:ITEMPW@gis.example.org/"
                        "arcgis/rest/services/Old/MapServer"})["url"]
@@ -4139,6 +4238,13 @@ def self_test():
             ["--server", SERVER, "--portal", "portal.example.org"]))
         check(code == 64 and "https://" in seen,
               "and so is a scheme-less --portal")
+        code, seen = captured(lambda: main(
+            ["--server", "https//svcuser:TYPOPW@gis.example.org/arcgis",
+             "--portal", PORTAL]))
+        check(code == 64 and "TYPOPW" not in seen
+              and "svcuser" not in seen,
+              "a --server whose scheme is mistyped is refused without "
+              "echoing the password in it  <-- pinned defect")
         code, seen = captured(lambda: main(ARGV + ["--apply"]))
         check(code == 64 and "--apply needs --out" in seen,
               "--apply with nowhere to write is a usage error")
@@ -4636,7 +4742,8 @@ def _main(argv):
             print("error: %s must start with https:// or http://, got %r. "
                   "urllib quotes a url it cannot open back into its own "
                   "error, and that url carries the token."
-                  % (label, sanitize_url(value)), file=sys.stderr)
+                  % (label, "<redacted>" if "@" in value
+                     else sanitize_url(value)), file=sys.stderr)
             return 64
     if args.apply and not args.out:
         print("error: --apply needs --out, the file to write the report to.",
