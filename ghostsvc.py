@@ -302,7 +302,10 @@ def sanitize_url(url):
             at = zone.rfind("@", 0, at)
         if at >= 0:
             rest = rest[base + at + 1:]
-        elif not portlike:
+        elif not portlike or re.search(r"@(?:[/]|[^/@]*:|$)", zone):
+            # No host can be told from the secret. In a host:port url an @
+            # followed by nothing or by a colon is not a path word like
+            # Parcels@2024: it is a credential end with an invalid host.
             return scheme + sep + "<redacted>"
     rest = rest.split("#", 1)[0]
     rest = rest.split("?", 1)[0]
@@ -2722,6 +2725,11 @@ def self_test():
               "an @ that is the first thing in a query or fragment does not "
               "expose the token after it: %s  <-- pinned defect"
               % sanitize_url(lead_at))
+    for no_host in ("https://user:1/2@h:abc/x?token=SECRET",
+                    "https://user:123/abc@/x?token=SECRET"):
+        check(sanitize_url(no_host) == "https://<redacted>",
+              "a password of digits and a / with no valid host after the @ "
+              "prints nothing of the url: %s  <-- pinned defect" % no_host)
     check(sanitize_url("https://u:PW@h/x?e=a@b&token=SECRET") == "https://h/x",
           "a real user:password@ is still removed beside a query @")
     check(sanitize_url("https://h:6443/x#f=1@2&token=SECRET")
@@ -4470,8 +4478,10 @@ def self_test():
         check("unrecognized arguments" in shown and "hunter2" not in shown,
               "an unknown argument, shape %d of 6, is named without the "
               "secret beside it in the error  <-- pinned defect" % number)
-    check("--password" in usage_text(["--password", "hunter2"])
+    check(usage_text(["--password", "hunter2"]).rstrip().endswith("arguments: --")
           and "--tokn" in usage_text(["--tokn=hunter2"])
+          and "SECRET" not in usage_text(["--tokenSECRET", "-pSECRET"])
+          and "SECRET" not in usage_text(["--SECRETFLAG"])
           and "no flag" in usage_text(["hunter2"])
           and usage_text(["-phunter2"]).rstrip().endswith("arguments: -p"),
           "the flag is still named, so the typo can be found")
@@ -4610,8 +4620,10 @@ class _Parser(argparse.ArgumentParser):
         parsed, extras = self.parse_known_args(args, namespace)
         if extras:
             # A single-dash flag may carry its value (-pSECRET): two characters.
-            flags = [a.split("=", 1)[0] if a.startswith("--") else a[:2]
-                     for a in extras if a.startswith("-")]
+            # A long flag is named only when it ends at an =; --tokenSECRET
+            # has no end to find, so it is cut to two characters as well.
+            flags = [a.split("=", 1)[0] if a.startswith("--") and "=" in a
+                     else a[:2] for a in extras if a.startswith("-")]
             self.error("unrecognized arguments: %s"
                        % (" ".join(flags) if flags else "a value with no flag"))
         return parsed

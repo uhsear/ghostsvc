@@ -627,7 +627,7 @@ followed by one of the six characters.
   `--self-test` beside a data run under one exit-code check.
 - `urllib` uses the proxy named by `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, so the token in the
   query string is visible to that proxy.
-- An unknown flag is named in the usage error without the value after it. `argparse` still quotes
+- An unknown flag is named in the usage error only when it is a long flag written `--name=value`, and then without the value. Any other unknown argument is cut to its first two characters (`--` or `-p`). `argparse` still quotes
   the value of a known flag it cannot parse, such as `--num` or `--format`, so do not put a secret
   there.
 - A cell with leading whitespace before a formula character is not guarded. Whether Excel evaluates such a cell was not checked.
