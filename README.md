@@ -190,12 +190,12 @@ PASS  a plausible-looking --unpublish is refused, because this tool changes noth
 PASS  the harness records a false check, a missing exception, a wrong exception, an argv argparse accepted, two bad enumerations, four bad url comparisons and three bad calls as thirteen failures, so a broken tool turns this self-test red  <-- pinned defect
 ...
 --------------------------------------------------------------------
-676 assertions, 0 failed
+680 assertions, 0 failed
 ```
 
 ## Requirements
 
-Python 3.9 or newer. The final file's self-test printed `676 assertions, 0 failed` on Windows 3.9.25, 3.10.20, 3.12.10 and 3.13.2, and on Linux 3.12.3 (run on the festie host with `python3 -W error`). The file parses under the 3.9 grammar (`ast.parse` with `feature_version=(3, 9)`) and uses no f-strings. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
+Python 3.9 or newer. The final file's self-test printed `680 assertions, 0 failed` on Windows 3.9.25, 3.10.20, 3.12.10 and 3.13.2, and on Linux 3.12.3 (run on the festie host with `python3 -W error`). The file parses under the 3.9 grammar (`ast.parse` with `feature_version=(3, 9)`) and uses no f-strings. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
 `argparse`, `datetime`, `getpass` and `re`, and `threading`, `http.server`, `tempfile`, `shutil` and `runpy` in the self-test. It
 runs on a plain `python3`. It was not run on ArcGIS Pro's own interpreter, so that is untested here. `arcpy` is not used and the `arcgis` package
 is not needed.
@@ -482,6 +482,12 @@ followed by one of the six characters.
   query. When it has no path and an `@` then a host name and a `/` or `?` follow, the tool keeps nothing
   of the url and prints `<redacted>`. A `user:password@` that a `?` or `#` and a later `@` follow, with no
   path before them, is treated the same way, so `https://u:p@ss?w@host/x` prints `<redacted>` and not `ss`.
+  An unbracketed text before the first `/` with two or more colons, such as `https://u:v:12/x/@[bad`, is never
+  host:port. The tool reads it as user and password and redacts when no host after an `@` is provable.
+  A host:port url keeps an `@` in the third or later path segment when the segments hold only letters, digits,
+  `. _ ~ -`, spaces or colons (`.../My Folder/P@2024/MapServer`, `.../a:b/MapServer@2`) and the text after the
+  `@` is not empty, not a `/` or `[`, and has no colon. `https://u:12/a/b/c@2` has the same shape and is kept, so a
+  password of 1 to 5 digits then a `/` and a deep path ending in an `@` plus a bare word can leave a tail.
   The common shape `host:6443/x?u=a@b.com` has a path and is kept. A url such as
   `https://host:6443?u=a@b.com&f=json`, a port followed straight by a query e-mail and a `&`, is kept too.
   A one-off fuzz run of 224,149 urls whose passwords held letters, digits and `@` but no `/`, `?` or `#`
@@ -607,7 +613,7 @@ followed by one of the six characters.
   branches, with no line left out (`python -m coverage run --branch ghostsvc.py --self-test`, then
   `python -m coverage report -m`). Linux was run without the coverage module, so the Linux run proves
   the assertions and not the percentage. The Windows 3.9.25, 3.10.20, 3.12.10 and 3.13.2 runs and the
-  Linux 3.12.3 run all print 676 assertions, because the self-test does not branch on the host.
+  Linux 3.12.3 run all print 680 assertions, because the self-test does not branch on the host.
 
 - The CSV excerpt above was captured from the real-socket block with a one-off script. The self-test asserts the same cells but does not print them.
 - A password that holds an `@` and then a `/` is cut whole, by searching the path for a host-shaped tail after a later `@`. With a user and password in the url, an `@` in the path is read as the credential end.

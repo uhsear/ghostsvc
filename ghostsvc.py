@@ -212,6 +212,11 @@ def _host_after_at(text, strict):
 # as in /arcgis/rest/services/Parcels, so the @ after it is a path word.
 _PLAIN_PATH = re.compile(r"(/[A-Za-z0-9._~-]*)+$")
 
+# A deeper path for the same exemption: three or more slashes before the @, so
+# the @ sits in at least the third segment, and spaces or colons are allowed in
+# the segments (My Folder, a:b). The @ is then still a path word, not a credential.
+_DEEP_PATH = re.compile(r"(/[A-Za-z0-9._~ :-]*){3,}$")
+
 # A service path after the catalog marker, in a url too odd to key.
 _CATALOG_PATH = re.compile(r"/(rest|admin)/services/[^/]", re.IGNORECASE)
 
@@ -287,9 +292,13 @@ def sanitize_url(url):
     query_at = re.search("[?#]", rest)
     scope = rest[:query_at.start()] if query_at else rest
     last_at = scope.rfind("@")
+    # Two or more colons in an unbracketed head are never host:port: userinfo.
+    one_colon = head.count(":") == 1 or head.startswith("[")
     bare_port = "@" not in head and (
-        ":" not in head or (re.fullmatch(r"\d{1,5}", head.rpartition(":")[2])
-                            and _PLAIN_PATH.match(scope[len(head):last_at])))
+        ":" not in head or (one_colon
+                            and re.fullmatch(r"\d{1,5}", head.rpartition(":")[2])
+                            and (_PLAIN_PATH.match(scope[len(head):last_at])
+                                 or _DEEP_PATH.match(scope[len(head):last_at]))))
     if last_at >= 0 and ":" in scope[:last_at] and not bare_port:
         tail = rest[last_at + 1:]
         stop = re.match("([^/?#]*)(.?)", tail)
@@ -317,7 +326,8 @@ def sanitize_url(url):
                 cut = len(head) + at + 1
         rest = rest[cut:]
     elif ":" in head and not head.startswith("["):
-        portlike = re.fullmatch(r"\d{1,5}", head.rpartition(":")[2]) is not None
+        portlike = (head.count(":") == 1 and re.fullmatch(
+            r"\d{1,5}", head.rpartition(":")[2]) is not None)
         # A port-like tail searches the path only: the query may hold an e-mail.
         if portlike:
             zone = re.split("[?#]", rest[len(head):], maxsplit=1)[0]
@@ -330,7 +340,7 @@ def sanitize_url(url):
             at = zone.rfind("@", 0, at)
         if at >= 0:
             rest = rest[base + at + 1:]
-        elif not portlike or re.search(r"@(?:[/]|[^/@]*:|$)", zone) or (
+        elif not portlike or re.search(r"@(?:[/[]|[^/@]*:|$)", zone) or (
                 re.match(r"/[^/@]*@", zone)):
             # No host can be told from the secret. In a host:port url an @
             # followed by nothing or by a colon is not a path word like
@@ -2837,6 +2847,18 @@ def self_test():
           == "https://h:6443/x/Parcels@2024/MapServer",
           "a real host:port keeps its port beside a query @ and a path @ "
           "whose tail is only digits")
+    for colons in ("https://u:v:12/ZQXMARK7b.c/@[bad",
+                   "ftp://u::6443//ZQXMARK7b.c@123/arcgis"):
+        check("ZQXMARK" not in sanitize_url(colons),
+              "a head with two or more colons is userinfo, never host:port: "
+              "%s  <-- pinned defect" % sanitize_url(colons))
+    for deep in ("https://h:6443/arcgis/rest/services/My Folder/P@2024/"
+                 "MapServer", "https://h:6443/arcgis/rest/services/a:b/"
+                 "MapServer@2"):
+        check(sanitize_url(deep) == deep,
+              "an @ in the third or later path segment of a host:port url is "
+              "kept even when a segment holds a space or a colon: %s  "
+              "<-- pinned defect" % sanitize_url(deep))
     check(sanitize_url("https://[::1]:6443/x?u=a@b.com&token=SECRET")
           == "https://[::1]:6443/x",
           "a bracketed IPv6 host is not mistaken for a credential")
