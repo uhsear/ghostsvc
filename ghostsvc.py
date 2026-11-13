@@ -169,10 +169,11 @@ _TYPE_BY_LOWER = dict((t.lower(), t) for t in SERVICE_TYPES)
 _HOST_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
 
 # A host name or address with an optional port, as sanitize_url accepts after
-# the @ that ends a credential. Digits alone are never a host (@2024 in a path
-# is a year or a version), but a dotted IPv4 address is.
+# the @ that ends a credential. Digits and dots alone are never a host (@2024
+# in a path is a year or a version), unless they form a full dotted IPv4 address.
 _AUTH_TAIL = re.compile(
-    r"^(?!\d+(:\d{1,5})?$)(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:\d{1,5})?$")
+    r"^(?!(?!\d+(\.\d+){3}(:\d{1,5})?$)\d+(\.\d+)*(:\d{1,5})?$)"
+    r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:\d{1,5})?$")
 
 
 def _host_then_path(tail):
@@ -302,10 +303,13 @@ def sanitize_url(url):
             at = zone.rfind("@", 0, at)
         if at >= 0:
             rest = rest[base + at + 1:]
-        elif not portlike or re.search(r"@(?:[/]|[^/@]*:|$)", zone):
+        elif not portlike or re.search(r"@(?:[/]|[^/@]*:|$)", zone) or (
+                re.match(r"/[^/@]*@", zone)):
             # No host can be told from the secret. In a host:port url an @
             # followed by nothing or by a colon is not a path word like
-            # Parcels@2024: it is a credential end with an invalid host.
+            # Parcels@2024: it is a credential end with an invalid host. An @
+            # in the first path segment is one too: user:123/abc@2024 reads as
+            # a password of digits, and ArcGIS puts no @ in its first segment.
             return scheme + sep + "<redacted>"
     rest = rest.split("#", 1)[0]
     rest = rest.split("?", 1)[0]
@@ -2730,6 +2734,13 @@ def self_test():
         check(sanitize_url(no_host) == "https://<redacted>",
               "a password of digits and a / with no valid host after the @ "
               "prints nothing of the url: %s  <-- pinned defect" % no_host)
+    for ambiguous in ("https://user:123/abc@2024/x",
+                      "https://user:1/2@h%2F/x?token=SECRET",
+                      "https://u:1/2@1.2/x?token=SECRET"):
+        check(sanitize_url(ambiguous) == "https://<redacted>",
+              "a digit password, a / and an @ whose tail is no valid host "
+              "(digits, a percent host) prints nothing of the url: %s  "
+              "<-- pinned defect" % sanitize_url(ambiguous))
     check(sanitize_url("https://u:PW@h/x?e=a@b&token=SECRET") == "https://h/x",
           "a real user:password@ is still removed beside a query @")
     check(sanitize_url("https://h:6443/x#f=1@2&token=SECRET")
