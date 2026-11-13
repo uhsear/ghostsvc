@@ -108,6 +108,8 @@ PASS  an @ that is the first thing in a query or fragment does not expose the to
 PASS  a password holding ? or # before its @ is cut whole, user name and password prefix included: https://h/x  <-- pinned defect
 PASS  a credential-shaped authority with no host after any @ keeps nothing of the url  <-- pinned defect
 ...
+PASS  a user, a password and a token on the portal url never reach the document  <-- pinned defect
+...
 PASS  the guarded lead characters are exactly = + - @ tab and carriage return, written out here so the constant cannot shrink unseen  <-- pinned defect
 PASS  a cell led by =, +, -, @, tab or carriage return gets one apostrophe  <-- pinned defect
 ...
@@ -120,6 +122,10 @@ PASS  the folder column is guarded for =, +, -, @, tab and carriage return  <-- 
 PASS  the item_access column is guarded for =, +, -, @, tab and carriage return  <-- pinned defect
 PASS  severity stays a plain number and kind and anonymous are untouched
 ...
+PASS  a csv from a run that exited 2 leads with an incomplete row, so it no longer looks like a clean file  <-- pinned defect
+...
+PASS  a ghost in a stock ArcGIS Server folder says so and is still reported, a ghost elsewhere says nothing, and a Utilities service with an item is no finding  <-- pinned defect
+...
 PASS  a password the server echoes back form-encoded or percent-encoded is redacted too  <-- pinned defect
 ...
 PASS  exactly 10,000 is the CAP and never a total  <-- pinned defect
@@ -128,6 +134,8 @@ PASS  a short page advances by the ten rows it got, not by the hundred it asked 
 ...
 PASS  a one day partition with nothing left to split on REFUSES  <-- pinned defect
 PASS  and the refusal says what an incomplete enumeration would do to the ghost list  <-- pinned defect
+...
+PASS  an item the portal stamped three days after this workstation's clock is still enumerated, so its live service is not a ghost  <-- pinned defect
 ...
 PASS  the default opener verifies the certificate  <-- pinned defect
 ...
@@ -170,6 +178,8 @@ PASS  an exception nothing foresaw exits 2, not 1 which means findings, and prin
 ...
 PASS  a --server with no --portal is a usage error, because every service would be a ghost  <-- pinned defect
 ...
+PASS  a run with no token writes its doubt into the csv, ahead of the findings, over a real socket  <-- pinned defect
+...
 PASS  an unknown flag is a usage error, exit 64, not argparse's 2  <-- pinned defect
 PASS  an unknown argument, shape 1 of 6, is named without the secret beside it in the error  <-- pinned defect
 ...
@@ -180,13 +190,13 @@ PASS  a plausible-looking --unpublish is refused, because this tool changes noth
 PASS  the harness records a false check, a missing exception, a wrong exception, an argv argparse accepted, two bad enumerations, four bad url comparisons and three bad calls as thirteen failures, so a broken tool turns this self-test red  <-- pinned defect
 ...
 --------------------------------------------------------------------
-632 assertions, 0 failed
+646 assertions, 0 failed
 ```
 
 ## Requirements
 
-Python 3.9 or newer. The final file's self-test printed `632 assertions, 0 failed` on Windows 3.9.25, 3.10.20, 3.11.15, 3.12.10 and 3.13.2, and on Linux 3.12.3 (run on the festie host with `python3 -W error`). The file parses under the 3.9 grammar (`ast.parse` with `feature_version=(3, 9)`) and uses no f-strings. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
-`time`, `argparse`, `datetime`, `getpass` and `re`, and `threading`, `http.server`, `tempfile`, `shutil` and `runpy` in the self-test. It
+Python 3.9 or newer. The final file's self-test printed `646 assertions, 0 failed` on Windows 3.9.25, 3.10.20, 3.11.15, 3.12.10 and 3.13.2, and on Linux 3.12.3 (run on the festie host with `python3 -W error`). The file parses under the 3.9 grammar (`ast.parse` with `feature_version=(3, 9)`) and uses no f-strings. Standard library only: `urllib`, `json`, `os`, `sys`, `ssl`, `io`, `csv`,
+`argparse`, `datetime`, `getpass` and `re`, and `threading`, `http.server`, `tempfile`, `shutil` and `runpy` in the self-test. It
 runs on a plain `python3`. It was not run on ArcGIS Pro's own interpreter, which is a 3.9 build, so that is untested here. `arcpy` is not used and the `arcgis` package
 is not needed.
 
@@ -211,7 +221,7 @@ Point it at the federated server and at the portal that is supposed to own its s
 ```
 export GHOSTSVC_PASSWORD='...'
 python ghostsvc.py --server https://gis.example.com/arcgis \
-    --portal https://portal.example.com/portal --username gis_admin
+    --portal https://portal.example.com/portal --username demo_publisher
 ```
 
 Keep the answer:
@@ -373,7 +383,7 @@ It refuses the same way when the catalog walk cannot finish, and when `--portal`
 cell should not start with. Every text in this report was typed by someone else: a service name, a folder, an item title, an item owner.
 A service named `=cmd` or an item titled `@evil` would otherwise run on the machine of whoever
 opens the report. Every text column therefore gets one leading apostrophe when it starts with one of
-those six characters. `severity` stays a plain number, and `kind` and `anonymous` are written by
+those six characters. A run that exited 2 for a doubt, such as a run with no token, writes one `incomplete` row per doubt ahead of the findings, so the file does not look like a clean one. `severity` stays a plain number, and `kind` and `anonymous` are written by
 this tool, so they are not touched. Only the CSV is guarded. The JSON report carries the raw text.
 
 ```
@@ -476,16 +486,27 @@ followed by one of the six characters.
   fragment and the user and password only.
 - A password that the server echoes back in an error is removed in its plain, form-encoded and
   percent-encoded spellings. Any other encoding is not recognised.
-- A server that answers with an HTTP redirect to another host gets the token, because `urllib`
-  follows it with the query string intact. The probe follows redirects too, without a token. A
-  server that redirects a probe or a catalog call sends the request to whatever host its `Location`
-  header names, so point `--server` and `--portal` only at hosts you trust.
+- The token goes to the host named in `--server` and `--portal`, in the query string of every request.
+  `urllib` requests a redirect target exactly as the server wrote its `Location` header and does not copy
+  the original query string onto it. A redirect to another host therefore gets the token only when its
+  `Location` carries it, as an ordinary http-to-https redirect that keeps the query string does. A
+  stub that answered 302 with a bare `Location` on a second host never showed that host the token. The probe
+  follows redirects too, without a token. Point `--server` and `--portal` only at hosts you trust.
 - Folder and service names come from the catalog and are percent-encoded one segment at a time before
   they go into a request path, so a space, a non-ASCII letter, `?` or `#` stays inside its segment.
   A name that is exactly `..` is not encoded and changes the path requested on the server host,
   never the host.
-- The window ends at the client's clock. An item the portal created a moment after that reading is
-  missed, and its service reads as a ghost. That is the safe direction, and a re-run clears it.
+- The date window of the item search ends at 2100-01-01, not at this workstation's clock, so an item the portal
+  stamped after the run began, or on a clock that runs ahead of this one, is still inside it. An item created
+  while the run is paging can still be missed or double-counted, and then the total moves, the run warns and
+  exits 2 when it has no finding. Esri's search page does not document the `created:[a TO b]` epoch-millisecond
+  range the enumeration depends on, so that syntax rests on observation.
+- Stock folders: Esri says the System folder "contains automatically deployed services that are used by
+  ArcGIS Server" and the Utilities folder "contains automatically deployed services that can be used by
+  application developers". Such a service normally has no portal item, so it may be listed as a ghost on every
+  run. The finding says "in a stock ArcGIS Server folder" and is still reported, because a publisher can put a
+  service there too. Filter or ignore those rows when you read the report. This was not checked against a
+  live site, and the System folder shows only with `--admin` or a token that can list it.
 - A run that only has enumeration warnings exits 2 when it has no finding, and says that it is not a
   clean result. Missing items can only add false ghosts, but an orphan could go unseen, so read the
   warnings and run again.
@@ -510,7 +531,6 @@ followed by one of the six characters.
 - These two Esri behaviours rest on observation and are not cited to an Esri page: the HTTP 200
   with error 499 `Token Required`, and whether `/rest/services` lists a stopped service. Ports 80
   and 443 are the plain HTTP and HTTPS defaults. Ports 6080 and 6443 are cited under Sources.
-- The tool does not read its CSV back, so consumers must strip one leading apostrophe themselves.
 - A token in a `;token=` path parameter of a portal item url is not removed, so it lands in the JSON
   `unreadable_items[].url` when that item url cannot be keyed.
 - `--format csv` or `--format json` without `--out` is ignored without a warning, and nothing is written.
@@ -528,6 +548,17 @@ followed by one of the six characters.
   `--max-folders`, `--format`), it prints that value. A secret typed into one of those flags is echoed.
 - The self-test sets and deletes `GHOSTSVC_PASSWORD` and `GHOSTSVC_TOKEN` in its own process, so a real value
   in the environment is gone for the rest of that process only.
+- A catalog entry whose type is not in `SERVICE_TYPES` ends the whole run with exit 2 instead of skipping that
+  service. After a new Enterprise release adds a service type, that is the likeliest cause of an exit 2 with
+  no other explanation.
+- `service_key()` does not call `sanitize_url()`. For an item url with a password that holds `@` and then `/`
+  (for example `https://ann:x@y@zed/q@host/...`), the key can be a fragment such as `zed/roads/MapServer`,
+  and that fragment is written to the `key` column of the JSON and the CSV. The url columns are cut as usual.
+- `--portal` or `--server` over plain `http://` sends the token in every query string, and the `--username`
+  password in clear text.
+- A password of one to five digits and then a `?`, such as `user:12?Hunter@host`, prints `user:12`. The two
+  digits look like a port, and the shortcut is named in the code.
+- `LICENSE` has CRLF line endings and the other three files have LF. This is a style point only.
 - A catalog that lists no service exits 2 and says so, because a wrong `--server` and a token that can list nothing give the same empty answer as a server with no service. A portal item beside an empty catalog is still an orphan, exit 1.
 - An error line printed to stderr is not re-encoded. Python writes stderr with a replacement for a character the console cannot hold, so a portal message with such a character does not end the run in an encoding error, and the exit code stays 2.
 - A token or password given in `--server` is cut from the output, but `--token` itself stays on the command line. A scheduled job should use `GHOSTSVC_TOKEN` only.
@@ -559,18 +590,20 @@ followed by one of the six characters.
   with `error: unexpected UnicodeEncodeError` and exit 2, and the report file is cut short.
 - `--out` truncates an existing file before it writes, so a write that fails destroys the previous
   report. Keep the last one under another name.
-- The CSV carries neither the warnings, the caveats nor the count of unreadable items. They are in the JSON and
-  on the console, so a CSV from a run that exited 2 on warnings looks complete.
+- The CSV leads with one `incomplete` row per doubt (an enumeration warning, a caveat, an empty catalog or
+  services that could not be probed), with the text in the `detail` column and the other columns empty. A
+  clean run has no such row. Skip rows whose `kind` is `incomplete` when you count findings. The count of
+  unreadable items is in the JSON and on the console only.
 - A cell is guarded by its first character. A text such as the item title `-5` becomes the text
   `'-5`, never a number. Only `severity` stays numeric. A leading line feed, a full-width `=`, `+`,
   `-` or `@`, and a formula character after a space, are not guarded.
 - A service type that is not in the tool's list of ArcGIS service types stops the run with exit 2,
   because the key cannot be built. That is a refusal, not a guess. Add the type to `SERVICE_TYPES`.
-- Coverage is 100 percent of statements and branches on Windows 3.13.2, 2074 statements and 436
+- Coverage is 100 percent of statements and branches on Windows 3.13.2, 2117 statements and 444
   branches, with no line left out (`python -m coverage run --branch ghostsvc.py --self-test`, then
   `python -m coverage report -m`). Linux was run without the coverage module, so the Linux run proves
   the assertions and not the percentage. The Windows 3.9.25, 3.10.20, 3.11.15, 3.12.10 and 3.13.2 runs and the
-  Linux 3.12.3 run all print 632 assertions, because the self-test does not branch on the host.
+  Linux 3.12.3 run all print 646 assertions, because the self-test does not branch on the host.
 
 - The CSV excerpt above was captured from the real-socket block with a one-off script. The self-test asserts the same cells but does not print them.
 - A token carried as a `;token=` path parameter in `--server`, `--portal` or an item url is kept in the output. Only the query, the fragment and the user and password are cut.

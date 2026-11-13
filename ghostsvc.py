@@ -31,7 +31,7 @@ also makes a temporary directory and removes it again.)
     python ghostsvc.py --server https://gis.example.com/arcgis \\
         --portal https://portal.example.com/portal --token TOKEN
     python ghostsvc.py --server https://gis.example.com/arcgis \\
-        --portal https://portal.example.com/portal --username gis_admin \\
+        --portal https://portal.example.com/portal --username demo_publisher \\
         --out ghosts.csv --format csv --apply
 
 Exit codes: 0 every service has an item and none answered anonymously (or
@@ -53,7 +53,6 @@ import os
 import re
 import ssl
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -96,6 +95,11 @@ SEARCH_CEILING = 10000
 # root partition starts at. Created dates are epoch milliseconds.
 DAY_MS = 86400000
 EPOCH_START_MS = 0
+# The root partition ends here when no clock is given: 2100-01-01. An item the
+# portal stamped after this workstation read its own clock, or on a portal whose
+# clock runs ahead of it, would fall outside [0 TO now] and its live service
+# would read as a ghost. A bound no clock reaches cannot exclude one.
+FAR_FUTURE_MS = 4102444800000
 
 # Item types the second bisect level splits on, used when one day still sits on
 # the search ceiling. The list does not have to be complete: every split is a
@@ -185,6 +189,16 @@ def _host_then_path(tail):
 
 # A service path after the catalog marker, in a url too odd to key.
 _CATALOG_PATH = re.compile(r"/(rest|admin)/services/[^/]", re.IGNORECASE)
+
+
+# Esri: the System folder "contains automatically deployed services that are
+# used by ArcGIS Server", and Utilities "contains automatically deployed
+# services that can be used by application developers". Such a service
+# normally has no portal item, so it reads as a ghost on every run. It is
+# still reported, because a publisher can also put a service in these folders.
+STOCK_FOLDERS = ("system", "utilities")
+STOCK_NOTE = ("in a stock ArcGIS Server folder, whose services may have no "
+              "portal item")
 
 
 class EnumerationIncomplete(RuntimeError):
@@ -870,7 +884,7 @@ def enumerate_items(fetch, base="", types=BISECT_TYPES, now_ms=None,
     above the cap into a ghost service on the report.
     """
     if now_ms is None:
-        now_ms = int(time.time() * 1000)
+        now_ms = FAR_FUTURE_MS
     if max_partitions < 1:
         raise ValueError("--max-partitions must be at least 1")
     pending = [Partition(base, EPOCH_START_MS, int(now_ms), types=tuple(types))]
@@ -1079,8 +1093,10 @@ def reconcile(services, items, anonymous=(), details=None, probes=None,
         else:
             continue
         tested = probes is None or bool(probes.get(key))
-        findings.append(Finding(kind, key, svc, mine, details.get(key, ""),
-                                tested))
+        detail = details.get(key, "")
+        if not mine and (svc.get("folder") or "").lower() in STOCK_FOLDERS:
+            detail = (detail + "; " if detail else "") + STOCK_NOTE
+        findings.append(Finding(kind, key, svc, mine, detail, tested))
     for key in sorted(by_key):
         for raw in by_key[key]:
             if id(raw) not in claimed:
@@ -1111,6 +1127,7 @@ def build_report(server, portal, query, taken, report):
         "unprobed": len(report.untested),
         "warnings": list(report.warnings),
         "caveats": list(report.caveats),
+        "doubts": doubts(report),
         "unreadable_items": sorted(report.unreadable, key=lambda r: r["id"]),
         "findings": [finding_record(f) for f in report.findings],
     }
@@ -1156,10 +1173,15 @@ def csv_rows(document):
 
     A finding with three items becomes three rows. A spreadsheet is filtered
     and sorted by column, and one row holding three item ids cannot be.
+    A run that could not give a clean answer puts one "incomplete" row per
+    doubt first, so the file says what the exit code 2 said.
     Every text cell passes through cell(). kind, severity and the yes/no
     column are written by this tool, never by the data, so they do not.
     """
     rows = []
+    for reason in document.get("doubts", ()):
+        rows.append(["incomplete", "", "", "", "", "", "", "", cell(reason),
+                     "", "", "", "", ""])
     for rec in document["findings"]:
         base = [rec["kind"], rec["severity"], cell(rec["key"]),
                 cell(rec["service_url"]), cell(rec["folder"]),
@@ -1266,9 +1288,26 @@ def exit_code(report):
     """
     if report.findings:
         return 1
-    unsure = (not report.services or report.warnings or report.caveats
-              or (report.untested and not report.probe_skipped))
-    return 2 if unsure else 0
+    return 2 if doubts(report) else 0
+
+
+def doubts(report):
+    """Why this run cannot give a clean answer, one sentence each.
+
+    exit_code reads this, and so do the JSON document and the CSV, because a
+    spreadsheet from a run that exited 2 would otherwise look the same as one
+    from a clean run. A finding does not clear a doubt: the doubts are listed
+    whatever the exit code is.
+    """
+    reasons = []
+    if not report.services:
+        reasons.append("the catalog listed no service")
+    reasons.extend(report.warnings)
+    reasons.extend(report.caveats)
+    if report.untested and not report.probe_skipped:
+        reasons.append("%d service(s) could not be probed, so one of them may "
+                       "be open to everyone" % len(report.untested))
+    return reasons
 
 
 # ------------------------------------------------------------------- plumbing
@@ -1782,7 +1821,7 @@ def self_test():
          "out of it  <-- pinned defect")
     same(REST + "/Roads/MapServer#layers", REST + "/Roads/MapServer",
          "and neither is a fragment")
-    same("https://gis_admin:hunter2@gis.example.org/arcgis/rest/services/"
+    same("https://demo_publisher:hunter2@gis.example.org/arcgis/rest/services/"
          "Roads/MapServer", REST + "/Roads/MapServer",
          "a url carrying inline credentials keys to the service without them  "
          "<-- pinned defect")
@@ -2740,6 +2779,13 @@ def self_test():
     check(document["server"] == SERVER,
           "a token on the server url does not reach the document  "
           "<-- pinned defect")
+    cred_doc = build_report(SERVER, "https://svc:PWHUNTER@" + PORTAL[8:]
+                            + "?token=LIVE", "orgid:ORG", "t", ranked)
+    check(cred_doc["portal"] == PORTAL
+          and "PWHUNTER" not in json.dumps(cred_doc)
+          and "LIVE" not in json.dumps(cred_doc),
+          "a user, a password and a token on the portal url never reach the "
+          "document  <-- pinned defect")
     check(len(document["findings"]) == 4, "every finding is in the document")
     check(document["findings"][0]["kind"] == "anonymous-ghost",
           "in the order they were ranked")
@@ -2852,6 +2898,53 @@ def self_test():
           "a run with no finding and an enumeration warning says it is not "
           "clean and exits 2, not 0  <-- pinned defect")
 
+    check(doubts(quiet_warned) == ["the total moved"],
+          "a warning is a doubt, worded as the warning was")
+    check(doubts(clean) == [] and doubts(reconcile([], [])) == [
+        "the catalog listed no service"],
+          "a clean run has no doubt and an empty catalog has one")
+    check(any("1 service(s) could not be probed" in text
+              for text in doubts(reconcile([roads], [], probes={
+                  road_key: False}))),
+          "a service nobody got an answer about is a doubt even when a "
+          "finding exists")
+    doubtful_doc = build_report(SERVER, PORTAL, "q", "t", quiet_warned)
+    check(doubtful_doc["doubts"] == ["the total moved"],
+          "the JSON document carries the doubts")
+    doubtful_rows = csv_rows(doubtful_doc)
+    check(doubtful_rows[0][0] == "incomplete" and doubtful_rows[0][8]
+          == "the total moved" and doubtful_rows[0][1] == ""
+          and all(len(row) == len(CSV_FIELDS) for row in doubtful_rows),
+          "a csv from a run that exited 2 leads with an incomplete row, so it "
+          "no longer looks like a clean file  <-- pinned defect")
+    quiet_doc = build_report(SERVER, PORTAL, "q", "t", clean)
+    check(csv_rows(quiet_doc) == [] and quiet_doc["doubts"] == [],
+          "and a clean run has no such row")
+    hostile = build_report(SERVER, PORTAL, "q", "t", Report(
+        [], ranked.services, ranked.items, [], ["=cmd"]))
+    check(csv_rows(hostile)[0][8] == "'=cmd",
+          "a doubt that quotes portal text goes through the formula guard")
+    check(all((exit_code(rep_) == 2) == (bool(doubts(rep_))
+                                         and not rep_.findings)
+              for rep_ in (clean, quiet_warned, reconcile([], []),
+                           reconcile([roads], [], probes={road_key: False}))),
+          "exit 2 means no finding and a doubt, and a doubt alone never "
+          "hides a finding")
+    unlisted = reconcile([water], [])
+    check(STOCK_NOTE in unlisted.findings[0].detail
+          and reconcile([rail], []).findings[0].detail == ""
+          and reconcile([water], [item("i9", REST + "/Utilities/Water/"
+                                       "FeatureServer")]).findings == [],
+          "a ghost in a stock ArcGIS Server folder says so and is still "
+          "reported, a ghost elsewhere says nothing, and a Utilities service "
+          "with an item is no finding  <-- pinned defect")
+    check(reconcile([svc("Search", "System")], []).findings[0].detail
+          == STOCK_NOTE and reconcile([water], [], details={
+              water["key"]: "answered with currentVersion and no token"},
+              anonymous=[water["key"]]).findings[0].detail.startswith(
+                  "answered with currentVersion and no token; in a stock"),
+          "the System folder is stock too, and the note joins a probe's own "
+          "reason instead of replacing it")
     check(printable("plain", "cp1252") == "plain",
           "an ascii title passes through a cp1252 console")
     check(printable(chr(0x6c34), "cp1252") == "?",
@@ -3187,8 +3280,16 @@ def self_test():
     walltime, _w = enumerate_items(Catalog(rows(3)), base="orgid:ORG",
                                    types=())
     check(len(walltime) == 3,
-          "an enumeration with no now_ms uses the wall clock and still reads "
-          "the org")
+          "an enumeration with no now_ms still reads the org")
+    ahead = (int(datetime.datetime.now(datetime.timezone.utc).timestamp()
+                 * 1000) + 3 * DAY_MS)
+    skewed = rows(2)
+    skewed[1]["created"] = ahead
+    got, _w = enumerate_items(Catalog(skewed), base="orgid:ORG", types=())
+    check(len(got) == 2 and skewed[1]["id"] in got and FAR_FUTURE_MS > ahead,
+          "an item the portal stamped three days after this workstation's "
+          "clock is still enumerated, so its live service is not a ghost  "
+          "<-- pinned defect")
 
     # ---- the server and the portal, answered in process
     #
@@ -3503,17 +3604,17 @@ def self_test():
     check(_error_text({"status": "ok", "services": []}) == "",
           "an answer that says nothing went wrong gives no message")
 
-    check(serving(site(), lambda: generate_token(PORTAL, "gis_admin",
+    check(serving(site(), lambda: generate_token(PORTAL, "demo_publisher",
                                                  "hunter2")) == "TESTTOKEN",
           "a username and password are exchanged for a token")
     signed = site()
-    serving(signed, lambda: generate_token(PORTAL, "gis_admin", "hunter2"))
+    serving(signed, lambda: generate_token(PORTAL, "demo_publisher", "hunter2"))
     check(any("password=hunter2" in body for body in signed.posted),
           "the password goes in the POST body, which is where it belongs")
     check(not any("password" in t for t in signed.targets),
           "the password never appears in a url  <-- pinned defect")
     refused_login = fails(lambda: serving(site(), lambda: generate_token(
-        PORTAL, "gis_admin", "wrongpass")),
+        PORTAL, "demo_publisher", "wrongpass")),
         "a rejected sign-in is raised, not returned as a token")
     check("Invalid username or password" in refused_login,
           "the portal's own reason survives into the error")
@@ -3521,7 +3622,7 @@ def self_test():
           "the rejected password is not quoted back in the error  "
           "<-- pinned defect")
     fails(lambda: serving(site(token=None), lambda: generate_token(
-        PORTAL, "gis_admin", "hunter2")),
+        PORTAL, "demo_publisher", "hunter2")),
         "a sign-in that returns no token raises rather than returning None")
 
     leaky = site(open_error=lambda target: ValueError(
@@ -3535,19 +3636,19 @@ def self_test():
     gateway = site(open_error=lambda target: urllib.error.HTTPError(
         target, 500, "Internal Server Error", {}, None))
     check("500" in fails(lambda: serving(gateway, lambda: generate_token(
-        PORTAL, "gis_admin", "hunter2")),
+        PORTAL, "demo_publisher", "hunter2")),
         "an HTTP error from a gateway is raised as an error"),
         "and the status code survives into the message")
     hidden = fails(lambda: serving(
         site(open_error=lambda t: ValueError("boom %s" % t)),
-        lambda: generate_token(PORTAL, "gis_admin", "hunter2")),
+        lambda: generate_token(PORTAL, "demo_publisher", "hunter2")),
         "a POST that blows up inside urllib is raised")
     check("hunter2" not in hidden,
           "and the password it carried is not in the message  "
           "<-- pinned defect")
     refered = site()
     serving(refered, lambda: generate_token(
-        "https://svc:PORTPW@gis.example.org/portal?token=PORTTOK", "gis_admin",
+        "https://svc:PORTPW@gis.example.org/portal?token=PORTTOK", "demo_publisher",
         "hunter2"))
     check(refered.posted and not any("PORTPW" in b or "PORTTOK" in b
                                      for b in refered.posted)
@@ -3595,7 +3696,7 @@ def self_test():
 
     os.environ[SECRET_ENV] = "from-the-environment"
     try:
-        check(read_secret("gis_admin") == "from-the-environment",
+        check(read_secret("demo_publisher") == "from-the-environment",
               "the password is read from %s when it is set" % SECRET_ENV)
     finally:
         del os.environ[SECRET_ENV]
@@ -3603,13 +3704,13 @@ def self_test():
     real_getpass = getpass.getpass
     getpass.getpass = lambda prompt: asked.append(prompt) or "typed-in"
     try:
-        check(read_secret("gis_admin") == "typed-in",
+        check(read_secret("demo_publisher") == "typed-in",
               "with no environment variable the password is prompted for")
     finally:
         getpass.getpass = real_getpass
     check(len(asked) == 1 and "not echoed" in asked[0],
           "the prompt says the password will not be echoed  <-- pinned defect")
-    check("gis_admin" in asked[0], "and names the user it is signing in as")
+    check("demo_publisher" in asked[0], "and names the user it is signing in as")
 
     # ---- the command line, end to end
     workdir = tempfile.mkdtemp(prefix="ghostsvc-selftest-")
@@ -3872,7 +3973,7 @@ def self_test():
         try:
             sign_in = site()
             code, seen = captured(lambda: serving(sign_in, lambda: main(
-                ARGV[:4] + ["--username", "gis_admin"])))
+                ARGV[:4] + ["--username", "demo_publisher"])))
         finally:
             del os.environ[SECRET_ENV]
         check(code == 1, "--username signs in and runs the reconcile")
@@ -3884,7 +3985,7 @@ def self_test():
         os.environ[SECRET_ENV] = "wrongpass"
         try:
             code, seen = captured(lambda: serving(site(), lambda: main(
-                ARGV[:4] + ["--username", "gis_admin"])))
+                ARGV[:4] + ["--username", "demo_publisher"])))
         finally:
             del os.environ[SECRET_ENV]
         check(code == 2, "a rejected sign-in exits 2")
@@ -3997,10 +4098,10 @@ def self_test():
         getpass.getpass = no_terminal
         try:
             code, seen = captured(lambda: serving(site(), lambda: main(
-                ARGV[:4] + ["--username", "gis_admin"])))
+                ARGV[:4] + ["--username", "demo_publisher"])))
         finally:
             getpass.getpass = real_getpass
-        check(code == 2 and "no password for gis_admin" in seen
+        check(code == 2 and "no password for demo_publisher" in seen
               and "Traceback" not in seen,
               "a --username run with no password and no terminal exits 2 "
               "with a message, not 1 with a traceback  <-- pinned defect")
@@ -4042,7 +4143,7 @@ def self_test():
         check(code == 64 and "--apply needs --out" in seen,
               "--apply with nowhere to write is a usage error")
         code, seen = captured(lambda: main(
-            ARGV[:4] + ["--username", "gis_admin", "--insecure"]))
+            ARGV[:4] + ["--username", "demo_publisher", "--insecure"]))
         check(code == 64 and "unverified connection" in seen,
               "--insecure with --username is refused, because that posts the "
               "password down an unverified connection  <-- pinned defect")
@@ -4168,6 +4269,19 @@ def self_test():
         check(any("token=SOCKTOK" in p for p in stub.seen
                   if p.split("?")[0].endswith("/search")),
               "while the portal search carried the token")
+        check(all(row[0] != "incomplete" for row in live),
+              "a run that ended clean over a socket has no incomplete row")
+        doubtful_csv = os.path.join(sockdir, "doubt.csv")
+        code, seen = captured(lambda: main(
+            sock_argv + ["--out", doubtful_csv, "--format", "csv",
+                         "--apply"]))
+        with io.open(doubtful_csv, "r", encoding="utf-8", newline="") as handle:
+            doubted = list(csv.reader(handle))
+        check(doubted[1][0] == "incomplete"
+              and "public items only" in doubted[1][CSV_FIELDS.index("detail")]
+              and doubted[2][0] == "anonymous",
+              "a run with no token writes its doubt into the csv, ahead of "
+              "the findings, over a real socket  <-- pinned defect")
         with io.open(sock_csv, "r", encoding="utf-8") as handle:
             live_text = handle.read()
         check("SOCKTOK" not in seen and "SOCKTOK" not in live_text,
